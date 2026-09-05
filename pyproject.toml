@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pecfetch"
+version = "1.0.0"
+description = "Estrattore read-only di caselle PEC verso una cartella condivisa, per consumo da parte di un componente a valle"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+# Estrazione testo: tutto opzionale, tutto caricato lazy.
+# Senza queste librerie pecfetch funziona lo stesso e annota text_status="tool_missing".
+# L'OCR usa gli eseguibili di sistema (poppler-utils, tesseract-ocr-ita):
+# vedi deploy/INSTALL.md. Qui solo i lettori PDF in Python.
+extract = [
+  "pypdf>=4.2",
+  "pdfminer.six>=20231228",
+]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+pecfetch = "pecfetch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["error::DeprecationWarning:pecfetch.*"]

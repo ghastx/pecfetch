@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+# Credenziali e configurazione reale: mai nel repository.
+config/*.toml
+!config/*.example.toml
+secrets.toml
+*.sqlite3
+*.log

@@ -1,0 +1,16 @@
+[Unit]
+Description=Esecuzione periodica di pecfetch
+Documentation=file:///opt/pecfetch/app/README.md
+
+[Timer]
+# Ogni 15 minuti, con un po' di dispersione per non bussare a 50 caselle
+# tutte allo stesso secondo dopo un riavvio.
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=120
+AccuracySec=30s
+Persistent=true
+Unit=pecfetch.service
+
+[Install]
+WantedBy=timers.target

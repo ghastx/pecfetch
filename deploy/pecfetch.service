@@ -1,0 +1,42 @@
+[Unit]
+Description=pecfetch - estrazione read-only delle caselle PEC
+Documentation=file:///opt/pecfetch/app/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pecfetch
+Group=pecfetch
+
+# Le password possono stare qui (permessi 600) invece che nel file dei segreti.
+# EnvironmentFile=-/etc/pecfetch/pecfetch.env
+
+ExecStart=/opt/pecfetch/venv/bin/pecfetch --config /etc/pecfetch/pecfetch.toml run
+
+# Exit code 2 = completato ma con caselle in errore: non è un fallimento del
+# servizio, il riepilogo è nel log. Exit code 3 = un altro run era in corso.
+SuccessExitStatus=2 3
+
+# Un run su 50 caselle con OCR può essere lungo, ma non deve durare per sempre.
+TimeoutStartSec=3600
+Nice=10
+IOSchedulingClass=idle
+
+# Irrigidimento: pecfetch legge IMAP e scrive solo in tre posti.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/lib/pecfetch /var/log/pecfetch /srv/pec/condivisa
+
+[Install]
+WantedBy=multi-user.target

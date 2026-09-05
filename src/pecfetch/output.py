@@ -1,0 +1,449 @@
+"""Scrittura del contratto di output sulla cartella condivisa.
+
+Due livelli, come richiesto dal consumatore che lavora in due passate:
+
+  ``indice/AAAA-MM-GG.jsonl``   un record per messaggio, compatto, per il triage;
+  ``coda/<messaggio>/``          metadati completi, corpo, allegati, testo degli
+                                 allegati, busta originale.
+
+Regole di scrittura:
+  * la comparsa di un messaggio è atomica: si monta tutto in ``.tmp-pecfetch``
+    e si sposta con un rename sulla stessa unità;
+  * il corpo sta in un file di testo a sé (``corpo.txt``), mai annegato in JSON;
+  * l'indice si accresce in append, una riga per messaggio, senza lock;
+  * ``esiti/`` è del consumatore: pecfetch la crea e non la tocca mai più.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from . import __version__
+from .extract import ExtractorSettings, extract_text
+from .naming import safe_filename, slugify, unique_filename
+from .pec import ParsedMessage, certified_or_best_date, receipt_class
+
+SCHEMA_INDEX = "pecfetch/indice/1"
+SCHEMA_MESSAGE = "pecfetch/messaggio/1"
+
+DIR_QUEUE = "coda"
+DIR_INDEX = "indice"
+DIR_OUTCOMES = "esiti"
+DIR_STAGING = ".tmp-pecfetch"
+
+FILE_METADATA = "messaggio.json"
+FILE_BODY = "corpo.txt"
+FILE_ENVELOPE = "busta.eml"
+FILE_POSTACERT = "postacert.eml"
+FILE_DATICERT = "daticert.xml"
+DIR_ATTACHMENTS = "allegati"
+
+
+@dataclass
+class WriteResult:
+    msg_id: str
+    content_dir: str          # relativo alla radice
+    index_file: str           # relativo alla radice
+    index_record: dict
+    already_present: bool = False
+    body_text: str = ""            # per l'archivio full-text, non riscritto su disco
+    attachment_text: str = ""
+
+
+class OutputWriter:
+    """Unico punto di scrittura sulla cartella condivisa."""
+
+    def __init__(self, root: Path, settings: ExtractorSettings,
+                 body_max_chars: int = 200_000,
+                 attachment_store_max_bytes: int = 50 * 1024 * 1024,
+                 timezone: str = "Europe/Rome"):
+        self.root = Path(root)
+        self.settings = settings
+        self.body_max_chars = body_max_chars
+        self.attachment_store_max_bytes = attachment_store_max_bytes
+        try:
+            self.tz = ZoneInfo(timezone)
+        except Exception:
+            self.tz = ZoneInfo("UTC")
+        self.ensure_layout()
+
+    # -- struttura -------------------------------------------------------
+    def ensure_layout(self) -> None:
+        for name in (DIR_QUEUE, DIR_INDEX, DIR_OUTCOMES, DIR_STAGING):
+            (self.root / name).mkdir(parents=True, exist_ok=True)
+        contract = self.root / "CONTRATTO.md"
+        if not contract.exists():
+            contract.write_text(_CONTRACT_TEXT, encoding="utf-8")
+        readme = self.root / DIR_OUTCOMES / "LEGGIMI.md"
+        if not readme.exists():
+            readme.write_text(_OUTCOMES_README, encoding="utf-8")
+
+    def index_path(self, when: datetime | None = None) -> Path:
+        when = when or datetime.now(self.tz)
+        try:
+            local = when.astimezone(self.tz)
+        except Exception:
+            local = when
+        return self.root / DIR_INDEX / f"{local:%Y-%m-%d}.jsonl"
+
+    # -- scrittura di un messaggio ---------------------------------------
+    def write_message(self, pm: ParsedMessage, raw: bytes, account, msg_id: str,
+                      uidvalidity: int, uid: int, fetched_at: str,
+                      extraction: bool = True) -> WriteResult:
+        """Monta la cartella del messaggio e la rende visibile con un rename."""
+        dir_name = self._dir_name(pm, account, msg_id)
+        final_dir = self.root / DIR_QUEUE / dir_name
+
+        staging = Path(tempfile.mkdtemp(prefix=f"{msg_id}-", dir=self.root / DIR_STAGING))
+        try:
+            record, texts = self._materialize(
+                staging, pm, raw, account, msg_id, uidvalidity, uid, fetched_at,
+                dir_name, extraction,
+            )
+            _fsync_tree(staging)
+            already = False
+            try:
+                os.rename(staging, final_dir)
+            except OSError:
+                if final_dir.exists():
+                    # Stesso msg_id = stesso contenuto sulla stessa casella:
+                    # il messaggio è già uscito, non lo si riscrive.
+                    already = True
+                    shutil.rmtree(staging, ignore_errors=True)
+                else:
+                    raise
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+
+        return WriteResult(
+            msg_id=msg_id,
+            content_dir=f"{DIR_QUEUE}/{dir_name}",
+            index_file="",
+            index_record=record,
+            already_present=already,
+            body_text=texts.get("corpo", ""),
+            attachment_text=texts.get("allegati", ""),
+        )
+
+    def append_index(self, record: dict, when: datetime | None = None) -> str:
+        """Aggiunge una riga all'indice del giorno. Ritorna il path relativo."""
+        path = self.index_path(when)
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        data = line.encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return f"{DIR_INDEX}/{path.name}"
+
+    def cleanup_staging(self, max_age_seconds: int = 86_400) -> int:
+        """Rimuove i montaggi rimasti a metà da esecuzioni interrotte."""
+        staging = self.root / DIR_STAGING
+        removed = 0
+        now = datetime.now().timestamp()
+        for entry in staging.iterdir() if staging.is_dir() else []:
+            try:
+                if now - entry.stat().st_mtime > max_age_seconds:
+                    shutil.rmtree(entry, ignore_errors=True)
+                    removed += 1
+            except OSError:
+                continue
+        return removed
+
+    # -- interno ---------------------------------------------------------
+    def _dir_name(self, pm: ParsedMessage, account, msg_id: str) -> str:
+        when = certified_or_best_date(pm)
+        try:
+            local = when.astimezone(self.tz)
+        except Exception:
+            local = when
+        subject_slug = slugify(pm.subject or pm.envelope_subject or "senza-oggetto")[:44]
+        parts = [
+            f"{local:%Y%m%d-%H%M}",
+            slugify(account.id)[:24],
+            subject_slug or "senza-oggetto",
+            msg_id[:12],
+        ]
+        return safe_filename("_".join(p for p in parts if p))
+
+    def _materialize(self, staging: Path, pm: ParsedMessage, raw: bytes, account,
+                     msg_id: str, uidvalidity: int, uid: int, fetched_at: str,
+                     dir_name: str, extraction: bool = True) -> tuple[dict, dict]:
+        """Ritorna (record d'indice, testi utili all'indicizzazione full-text)."""
+        (staging / DIR_ATTACHMENTS).mkdir(parents=True, exist_ok=True)
+
+        # 1. sorgente originale, sempre e comunque
+        (staging / FILE_ENVELOPE).write_bytes(raw)
+        if pm.postacert_raw:
+            (staging / FILE_POSTACERT).write_bytes(pm.postacert_raw)
+        if pm.daticert_raw:
+            (staging / FILE_DATICERT).write_bytes(pm.daticert_raw)
+
+        # 2. corpo in un file di testo a sé
+        body = pm.body_text or ""
+        body_truncated = False
+        if len(body) > self.body_max_chars:
+            body = body[: self.body_max_chars] + (
+                f"\n\n[…troncato da pecfetch: il corpo completo è in {FILE_ENVELOPE}]"
+            )
+            body_truncated = True
+        (staging / FILE_BODY).write_text(body, encoding="utf-8")
+
+        # 3. allegati + testo estratto accanto a ciascuno
+        taken: set[str] = set()
+        attachments_meta: list[dict] = []
+        extracted_texts: list[str] = []
+        for att in pm.attachments:
+            stored_name = unique_filename(att.filename or "allegato", taken)
+            entry: dict = {
+                "nome": att.filename,
+                "nome_file": stored_name,
+                "percorso": f"{DIR_ATTACHMENTS}/{stored_name}",
+                "content_type": att.content_type,
+                "byte": att.size,
+                "sha256": att.sha256,
+            }
+            if att.inline:
+                entry["inline"] = True
+            if att.size > self.attachment_store_max_bytes:
+                entry["salvato"] = False
+                entry["motivo"] = "oltre la soglia di salvataggio"
+                entry.pop("percorso", None)
+                entry["testo"] = {"method": "none", "status": "skipped_too_large",
+                                  "chars": 0}
+                attachments_meta.append(entry)
+                continue
+
+            (staging / DIR_ATTACHMENTS / stored_name).write_bytes(att.payload)
+            entry["salvato"] = True
+            settings = self.settings
+            if not extraction:
+                settings = replace(self.settings, enabled=False)
+            result = extract_text(att.payload, att.filename, att.content_type,
+                                  settings)
+            entry["testo"] = result.as_dict()
+            if result.text:
+                extracted_texts.append(result.text)
+                text_name = f"{stored_name}.txt"
+                (staging / DIR_ATTACHMENTS / text_name).write_text(
+                    result.text, encoding="utf-8"
+                )
+                entry["testo"]["percorso"] = f"{DIR_ATTACHMENTS}/{text_name}"
+            attachments_meta.append(entry)
+
+        record = self._index_record(
+            pm, account, msg_id, uidvalidity, uid, fetched_at, dir_name,
+            attachments_meta, len(body), body_truncated,
+        )
+        metadata = self._full_metadata(pm, record, raw, attachments_meta)
+        (staging / FILE_METADATA).write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        return record, {"corpo": body, "allegati": "\n".join(extracted_texts)}
+
+    def _index_record(self, pm: ParsedMessage, account, msg_id: str,
+                      uidvalidity: int, uid: int, fetched_at: str, dir_name: str,
+                      attachments_meta: list[dict], body_chars: int,
+                      body_truncated: bool) -> dict:
+        content_dir = f"{DIR_QUEUE}/{dir_name}"
+        record = {
+            "schema": SCHEMA_INDEX,
+            "id": msg_id,
+            "acquisito_il": fetched_at,
+            "casella": {
+                "id": account.id,
+                "etichetta": account.display,
+                "indirizzo": account.address,
+                "cliente": account.client_id or account.id,
+            },
+            "tipo": pm.msg_type,
+            "certificato": pm.certified,
+            "data": {
+                "certificata": _iso(pm.date_certified),
+                "invio": _iso(pm.date_sent),
+                "ricezione": _iso(pm.date_received),
+            },
+            "mittente": {
+                "indirizzo": pm.from_addr.get("address", ""),
+                "nome": pm.from_addr.get("name", ""),
+                "dominio": pm.from_addr.get("domain", ""),
+            },
+            "destinatari": [a.get("address", "") for a in pm.to if a.get("address")],
+            "copia": [a.get("address", "") for a in pm.cc if a.get("address")],
+            "oggetto": pm.subject,
+            "allegati": [
+                {
+                    "nome": a["nome"],
+                    "content_type": a.get("content_type", ""),
+                    "byte": a.get("byte", 0),
+                    "testo": a.get("testo", {}).get("status", ""),
+                    "metodo": a.get("testo", {}).get("method", ""),
+                    "caratteri": a.get("testo", {}).get("chars", 0),
+                }
+                for a in attachments_meta
+            ],
+            "message_id": pm.message_id,
+            "identificativo_pec": pm.pec_identifier,
+            "gestore": pm.gestore,
+            "contenuto": {
+                "cartella": content_dir,
+                "metadati": f"{content_dir}/{FILE_METADATA}",
+                "corpo": f"{content_dir}/{FILE_BODY}",
+                "busta": f"{content_dir}/{FILE_ENVELOPE}",
+                "caratteri_corpo": body_chars,
+                "corpo_troncato": body_truncated,
+                "corpo_origine": pm.body_source,
+            },
+            "imap": {"uidvalidity": uidvalidity, "uid": uid},
+        }
+        if pm.receipt_kind:
+            record["ricevuta"] = {
+                "tipo": pm.receipt_kind,
+                "classe": receipt_class(pm.msg_type) or "",
+                "riferimento_message_id": pm.ref_message_id,
+                "errore": pm.error_detail,
+            }
+        if pm.flags:
+            record["note"] = list(pm.flags)
+        return record
+
+    def _full_metadata(self, pm: ParsedMessage, record: dict, raw: bytes,
+                       attachments_meta: list[dict]) -> dict:
+        dc = pm.daticert
+        meta = {
+            "schema": SCHEMA_MESSAGE,
+            "generato_da": f"pecfetch/{__version__}",
+            **{k: v for k, v in record.items() if k != "schema"},
+            "destinatari_completi": pm.to,
+            "copia_completa": pm.cc,
+            "rispondi_a": pm.reply_to,
+            "busta": {
+                "oggetto": pm.envelope_subject,
+                "mittente": pm.envelope_from,
+                "message_id": pm.envelope_message_id,
+                "byte": len(raw),
+                "file": FILE_ENVELOPE,
+                "postacert": FILE_POSTACERT if pm.postacert_raw else None,
+                "daticert": FILE_DATICERT if pm.daticert_raw else None,
+            },
+            "allegati": attachments_meta,
+            "header": pm.headers,
+        }
+        if dc:
+            meta["daticert"] = {
+                "tipo": dc.tipo,
+                "errore": dc.errore,
+                "mittente": dc.mittente,
+                "destinatari": dc.destinatari,
+                "oggetto": dc.oggetto,
+                "gestore": dc.gestore,
+                "data": _iso(dc.data),
+                "identificativo": dc.identificativo,
+                "msgid": dc.msgid,
+                "ricevuta_tipo": dc.ricevuta_tipo,
+                "consegna": dc.consegna,
+                "errore_esteso": dc.errore_esteso,
+            }
+        return meta
+
+
+def _iso(value) -> str | None:
+    if value is None:
+        return None
+    try:
+        return value.isoformat()
+    except Exception:
+        return None
+
+
+def _fsync_tree(path: Path) -> None:
+    """Forza su disco prima del rename: niente file a metà nella coda."""
+    for entry in sorted(path.rglob("*")):
+        if entry.is_file():
+            try:
+                fd = os.open(entry, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+_CONTRACT_TEXT = """# Contratto di output di pecfetch
+
+Cartella prodotta da `pecfetch`. Sola lettura per chiunque non sia pecfetch,
+tranne `esiti/` che è del consumatore.
+
+## Struttura
+
+    indice/AAAA-MM-GG.jsonl   un record JSON per riga, un messaggio per record.
+                              Serve al triage: si legge in blocco senza aprire
+                              altro. I record sono indipendenti e in sola
+                              append.
+    coda/<messaggio>/         il contenuto completo di un messaggio:
+        messaggio.json        metadati completi (superset del record d'indice)
+        corpo.txt             corpo del messaggio, testo normalizzato
+        allegati/<file>       allegato con il nome originale sanificato
+        allegati/<file>.txt   testo estratto dall'allegato (quando ricavabile)
+        busta.eml             sorgente originale integrale
+        postacert.eml         messaggio interno alla busta di trasporto
+        daticert.xml          metadati certificati del gestore
+    esiti/                    riservata al consumatore, append-only
+    .tmp-pecfetch/            area di montaggio di pecfetch, da ignorare
+
+## Garanzie
+
+* Una cartella dentro `coda/` compare per intero o non compare: viene montata
+  altrove e spostata con un rename.
+* `id` è la chiave stabile del messaggio: identico fra indice, metadati ed
+  esiti. Deriva dal contenuto della busta e dalla casella ricevente.
+* Le ricevute positive (accettazione, presa in carico, avvenuta consegna) NON
+  compaiono qui: sono registrate nello stato locale di pecfetch. In output
+  arrivano solo le ricevute negative, cioè gli invii falliti.
+* Il consumatore può spostare o cancellare quello che ha processato: pecfetch
+  non riscrive nulla di già uscito, perché la verità su cosa è stato scaricato
+  sta nel suo stato locale, non nella presenza dei file.
+* `corpo.txt` è sempre testo: se il messaggio aveva solo HTML, è stato
+  convertito. Se il corpo è stato troncato, il record d'indice lo dichiara in
+  `contenuto.corpo_troncato`.
+* Il testo degli allegati riporta metodo ed esito dell'estrazione
+  (`allegati[].metodo`, `allegati[].testo`): `pdf_ocr` significa OCR, quindi
+  testo potenzialmente incerto.
+"""
+
+_OUTCOMES_README = """# esiti/
+
+Spazio riservato al componente a valle. pecfetch crea questa cartella e non ci
+scrive, non la legge e non ne dipende in alcun modo.
+
+Convenzione suggerita: un file JSONL al giorno, `AAAA-MM-GG.jsonl`, append-only,
+un record per messaggio processato, con almeno:
+
+    {"id": "<id del messaggio, come nell'indice>",
+     "elaborato_il": "2026-09-05T10:31:00+02:00",
+     "esito": "...", "note": "..."}
+
+I file di input non vanno modificati: restano immutabili.
+"""
+
+__all__ = ["OutputWriter", "WriteResult", "SCHEMA_INDEX", "SCHEMA_MESSAGE",
+           "DIR_QUEUE", "DIR_INDEX", "DIR_OUTCOMES", "DIR_STAGING"]

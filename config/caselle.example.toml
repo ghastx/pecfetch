@@ -1,0 +1,30 @@
+# Elenco delle caselle PEC. Un blocco per casella.
+# Copiare in /etc/pecfetch/caselle.toml (permessi 600 se contiene [passwords]).
+
+[[accounts]]
+id = "rossi"
+label = "Rossi S.r.l."
+client_id = "ROSSI"
+address = "rossi@pec.it"
+host = "imaps.pec.aruba.it"
+port = 993
+folder = "INBOX"
+password_env = "PECFETCH_PW_ROSSI"
+
+[[accounts]]
+id = "bianchi"
+label = "Bianchi S.p.A."
+client_id = "BIANCHI"
+address = "bianchi@legalmail.it"
+host = "imapmail.legalmail.it"
+port = 993
+folder = "INBOX"
+password_env = "PECFETCH_PW_BIANCHI"
+
+# Casella momentaneamente esclusa dalle esecuzioni: nessuna password richiesta.
+# [[accounts]]
+# id = "verdi"
+# label = "Verdi S.n.c."
+# address = "verdi@pec.it"
+# host = "imaps.pec.aruba.it"
+# enabled = false

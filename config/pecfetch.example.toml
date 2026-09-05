@@ -1,0 +1,110 @@
+# ---------------------------------------------------------------------------
+# pecfetch - configurazione di esempio
+#
+# Copiare in /etc/pecfetch/pecfetch.toml e adattare.
+# Questo file NON contiene password: quelle stanno in un file separato o in
+# variabili d'ambiente (vedi in fondo).
+# ---------------------------------------------------------------------------
+
+[general]
+# Radice della cartella condivisa letta dal componente a valle (e da Windows).
+output_root = "/srv/pec/condivisa"
+
+# Stato locale di pecfetch: cursori UID, deduplica, diario delle esecuzioni.
+# Deve stare su disco locale della VM, non sulla condivisione.
+state_dir = "/var/lib/pecfetch"
+
+# File con le password, permessi 600, fuori dal repository.
+secrets_file = "/etc/pecfetch/secrets.toml"
+
+# Elenco delle caselle in un file separato (comodo con 50 caselle).
+# Se assente, le caselle si dichiarano qui sotto con [[accounts]].
+accounts_file = "caselle.example.toml"
+
+# Fuso orario usato per i nomi dei file d'indice e delle cartelle.
+timezone = "Europe/Rome"
+
+
+[fetch]
+# Primo avvio prudente: quanti giorni indietro guardare la prima volta.
+# Per l'archivio storico serve un comando esplicito: `pecfetch backfill`.
+initial_lookback_days = 7
+
+# Quando la UIDVALIDITY cambia (il gestore ha ricreato la casella) si
+# risincronizza per data, tornando indietro di questo margine.
+resync_overlap_days = 2
+
+# Tetto per esecuzione, per casella. Quello che avanza viene preso dopo.
+max_messages_per_run = 500
+
+# Buste più grandi di così non vengono scaricate: vengono registrate come
+# errore nel riepilogo e il cursore avanza per non bloccare la casella.
+max_message_bytes = 52428800   # 50 MiB
+
+# Timeout IMAP e tentativi di riconnessione per casella.
+timeout = 60
+connect_retries = 2
+
+
+[body]
+# Oltre questa soglia il corpo viene troncato in corpo.txt (e dichiarato
+# nell'indice). Il testo integrale resta sempre in busta.eml.
+max_chars = 200000
+
+
+[attachments]
+# Allegati più grandi di così non vengono salvati sulla condivisione, ma
+# restano censiti nell'indice e nei metadati.
+max_store_bytes = 52428800     # 50 MiB
+# Allegati più grandi di così vengono salvati ma non se ne estrae il testo.
+max_extract_bytes = 26214400   # 25 MiB
+
+
+[extraction]
+enabled = true
+# Ripiego OCR quando l'estrazione diretta da un PDF torna vuota (atti scansionati).
+ocr = true
+ocr_lang = "ita"
+ocr_max_pages = 20
+ocr_dpi = 300
+ocr_timeout = 300
+# Sbustamento delle firme digitali CAdES (.p7m): senza, il testo degli atti
+# firmati non si estrae.
+p7m_unwrap = true
+timeout = 120
+max_text_chars = 400000
+
+
+[archive]
+# Archivio storico interrogabile (SQLite + ricerca full-text).
+# Vuoto = <state_dir>/archivio.sqlite3, cioè su disco locale.
+# ATTENZIONE: metterlo sulla condivisione SMB espone al locking di CIFS,
+# che con SQLite dà corruzioni. Farlo solo sapendo cosa si rischia.
+path = ""
+
+
+[logging]
+level = "INFO"
+file = "/var/log/pecfetch/pecfetch.log"
+
+
+# ---------------------------------------------------------------------------
+# Le caselle possono stare qui invece che in accounts_file.
+# La password si indica in uno di questi tre modi:
+#   password_env  = "PECFETCH_PW_ROSSI"   variabile d'ambiente
+#   password_file = "/etc/pecfetch/pw/rossi"  file con permessi 600
+#   password_ref  = "rossi"               voce [passwords] nel file dei segreti
+# In assenza di indicazioni si cerca in [passwords] una voce con l'id casella.
+# ---------------------------------------------------------------------------
+
+# [[accounts]]
+# id = "rossi"                     # identificatore breve, entra nei nomi file
+# label = "Rossi S.r.l."           # etichetta leggibile per il consumatore
+# client_id = "ROSSI"              # codice cliente dello studio
+# address = "rossi@pec.it"
+# host = "imaps.pec.aruba.it"
+# port = 993
+# username = "rossi@pec.it"        # se diverso dall'indirizzo
+# folder = "INBOX"
+# password_env = "PECFETCH_PW_ROSSI"
+# enabled = true
