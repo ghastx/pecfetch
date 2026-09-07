@@ -92,8 +92,25 @@ class SearchHit:
 
 
 class Archive:
-    def __init__(self, path: str | Path):
+    """L'archivio storico. Con ``read_only`` non viene scritto in nessun caso.
+
+    Il consumatore a valle interroga la memoria storica ma non deve poterla
+    alterare nemmeno per sbaglio: ``mode=ro`` lo garantisce a livello di SQLite,
+    non a livello di buone intenzioni.
+    """
+
+    def __init__(self, path: str | Path, read_only: bool = False):
         self.path = Path(path)
+        self.read_only = read_only
+        if read_only:
+            if not self.path.exists():
+                raise FileNotFoundError(f"archivio non trovato: {self.path}")
+            self.db = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, timeout=30,
+                isolation_level=None,
+            )
+            self.db.row_factory = sqlite3.Row
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
@@ -126,6 +143,8 @@ class Archive:
     def add(self, record: dict, index_file: str, body_text: str = "",
             attachment_text: str = "") -> None:
         """Inserisce (o rimpiazza) un record. Idempotente sull'id."""
+        if self.read_only:
+            raise RuntimeError("archivio aperto in sola lettura")
         msg_id = record["id"]
         mailbox = record.get("casella", {})
         sender = record.get("mittente", {})

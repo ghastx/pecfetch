@@ -9,9 +9,12 @@ import sys
 from pathlib import Path
 
 _SECRET_RE = re.compile(
-    r"(?i)\b(password|passwd|pwd|token|secret)\b\s*[:=]\s*\S+"
+    r"(?i)\b(password|passwd|pwd|token|secret|api[-_ ]?key|x-api-key)\b\s*[:=]\s*\S+"
 )
 _LOGIN_RE = re.compile(r"(?i)\b(LOGIN|AUTHENTICATE)\s+(\S+)\s+(\S+)")
+#: le chiavi Anthropic hanno una forma riconoscibile: sparisce il valore,
+#: ovunque compaia e comunque ci sia finita.
+_APIKEY_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")
 
 
 class RedactFilter(logging.Filter):
@@ -24,6 +27,7 @@ class RedactFilter(logging.Filter):
             return True
         redacted = _SECRET_RE.sub(r"\1=***", message)
         redacted = _LOGIN_RE.sub(r"\1 \2 ***", redacted)
+        redacted = _APIKEY_RE.sub("sk-ant-***", redacted)
         if redacted != message:
             record.msg = redacted
             record.args = ()

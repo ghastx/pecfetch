@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pecfetch"
 version = "1.0.0"
-description = "Estrattore read-only di caselle PEC verso dati strutturati, per consumo da parte di un componente a valle"
+description = "pecfetch: estrattore read-only di caselle PEC. pecdesk: smistamento della coda con l'API Anthropic"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -20,10 +20,15 @@ extract = [
   "pypdf>=4.2",
   "pdfminer.six>=20231228",
 ]
+# pecdesk: il consumatore della coda. Unica dipendenza esterna del progetto
+# oltre agli estrattori di testo; installare pecfetch da solo resta a zero
+# dipendenze, come deve essere su una VM che deve girare per anni.
+pecdesk = ["anthropic>=0.69"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
 pecfetch = "pecfetch.cli:main"
+pecdesk = "pecdesk.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -31,4 +36,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-filterwarnings = ["error::DeprecationWarning:pecfetch.*"]
+filterwarnings = [
+  "error::DeprecationWarning:pecfetch.*",
+  "error::DeprecationWarning:pecdesk.*",
+]

@@ -1,0 +1,16 @@
+[Unit]
+Description=Esecuzione giornaliera di pecdesk
+Documentation=file:///opt/pecfetch/app/README.md
+
+[Timer]
+# Una volta al mattino presto: il riepilogo dev'essere sul telefono del
+# titolare prima che apra lo studio. pecfetch continua a girare ogni 15
+# minuti per conto suo: i due programmi non si aspettano a vicenda.
+OnCalendar=Mon..Sat 07:15
+RandomizedDelaySec=300
+AccuracySec=1min
+Persistent=true
+Unit=pecdesk.service
+
+[Install]
+WantedBy=timers.target

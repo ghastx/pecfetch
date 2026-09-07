@@ -1,0 +1,44 @@
+[Unit]
+Description=pecdesk - smistamento della coda PEC prodotta da pecfetch
+Documentation=file:///opt/pecfetch/app/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pecdesk
+Group=pecfetch
+
+# La chiave API e la password SMTP stanno qui (permessi 600) oppure nei file
+# indicati da api_key_file / smtp_password_file. Mai nel repository.
+EnvironmentFile=/etc/pecdesk/pecdesk.env
+
+ExecStart=/opt/pecfetch/venv/bin/pecdesk --config /etc/pecdesk/pecdesk.toml run
+
+# Exit code 2 = completato ma con messaggi non lavorati: non è un fallimento
+# del servizio, il riepilogo lo dice. Exit code 3 = un altro run era in corso.
+SuccessExitStatus=2 3
+
+TimeoutStartSec=1800
+Nice=10
+
+# Irrigidimento: pecdesk legge la coda, scrive in esiti/ e lavorati/, e parla
+# solo con l'API di Anthropic e con l'SMTP dello studio.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+# L'archivio di pecfetch è montato in sola lettura: pecdesk non deve poterci
+# scrivere nemmeno se un giorno il codice sbagliasse.
+ReadOnlyPaths=/var/lib/pecfetch
+ReadWritePaths=/var/lib/pecdesk /var/log/pecdesk /srv/pec/dati/esiti /srv/pec/dati/lavorati
+
+[Install]
+WantedBy=multi-user.target

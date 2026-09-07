@@ -1,0 +1,119 @@
+# ---------------------------------------------------------------------------
+# pecdesk - configurazione di esempio
+#
+# Copiare in /etc/pecdesk/pecdesk.toml e adattare.
+# Questo file NON contiene segreti: né la chiave API né la password SMTP.
+# ---------------------------------------------------------------------------
+
+[general]
+# Radice di output di pecfetch. pecdesk legge `coda/`, scrive solo in `esiti/`
+# e sposta il lavorato in `lavorati/`. I file di input restano immutabili.
+output_root = "/srv/pec/dati"
+
+# Archivio storico di pecfetch: serve al segnale relazionale ("questo mittente
+# ha mai scritto prima a questa casella?"). Aperto SEMPRE in sola lettura.
+archive_path = "/var/lib/pecfetch/archivio.sqlite3"
+
+# Stato locale di pecdesk: cosa è stato giudicato, i tentativi, i riepiloghi.
+# Separato da quello di pecfetch: sono due programmi.
+state_dir = "/var/lib/pecdesk"
+
+# Dove finisce ciò che è stato lavorato. Vuoto = <output_root>/lavorati.
+# Deve stare sullo stesso filesystem della coda: lo spostamento è un rename.
+worked_dir = ""
+
+timezone = "Europe/Rome"
+
+# Dopo N tentativi falliti un messaggio resta in coda ma non si ritenta più
+# da solo: `pecdesk stato` lo mostra, `pecdesk riprova <id>` lo sblocca.
+tentativi_massimi = 3
+
+
+[direttive]
+# I due file delle direttive, riletti a ogni esecuzione e tenuti sotto
+# controllo di versione. Non stanno in config/ apposta: config/*.toml è
+# escluso dal repository.
+regole = "/etc/pecdesk/direttive/regole.toml"
+istruzioni = "/etc/pecdesk/direttive/istruzioni.md"
+
+
+[modello]
+# L'obiettivo è la selezione, non l'analisi: il compito è alla portata di un
+# modello economico. Alternative: claude-sonnet-5 (più giudizio, ~4x il costo).
+id = "claude-haiku-4-5"
+
+# La risposta è un oggetto JSON in campi chiusi: non serve spazio.
+max_tokens = 400
+
+# La chiave API sta FUORI dal repository e non compare nei log.
+# Una delle due forme, mai la chiave in chiaro qui dentro:
+api_key_env = "ANTHROPIC_API_KEY"
+# api_key_file = "/etc/pecdesk/api.key"        # permessi 600
+
+
+[api]
+# I ritentativi sugli errori transitori li fa l'SDK.
+ritentativi = 3
+timeout_secondi = 60
+
+# Tetto per esecuzione: non si lavora un anno di arretrato in una notte.
+messaggi_massimi = 200
+
+# Dopo N fallimenti di fila si smette di chiamare: è un guasto sistemico, non
+# un caso. Il riepilogo parte lo stesso, dicendo cosa non è stato lavorato.
+fallimenti_consecutivi_massimi = 5
+
+# Pausa fra una chiamata e l'altra, se si vuole andare piano.
+pausa_secondi = 0
+
+
+[materiale]
+# Quanto testo si manda al modello. Tutto quello che viene tagliato è
+# dichiarato nell'esito, così chi legge sa su cosa è stato dato il giudizio.
+corpo_caratteri = 1500
+# Per ogni allegato: una testa più poche finestre attorno alle parole chiave.
+allegato_caratteri = 1200
+allegato_testa_caratteri = 600
+finestre = 4
+finestra_caratteri = 240
+# Quanti allegati portano testo; gli altri restano solo nell'inventario.
+allegati_massimi = 3
+# Tetto complessivo sul materiale non fidato.
+totale_caratteri = 4000
+
+
+[sospetto]
+# Il segnale "mittente mai visto" ha una partenza a freddo: su un archivio
+# giovane ogni mittente è nuovo. Sotto queste soglie il segnale viene emesso
+# come informativo e da solo non fa scattare niente.
+storico_minimo_giorni = 90
+storico_minimo_messaggi = 20
+
+
+[riepilogo]
+# UN SOLO destinatario, fisso, mai dedotto dal contenuto dei messaggi, mai una
+# casella PEC. È l'unica email che pecdesk spedisce.
+destinatario = "titolare@studio.example.it"
+mittente = "pecdesk@studio.example.it"
+prefisso_oggetto = "PEC"
+
+# Submission su una casella ORDINARIA dello studio.
+smtp_host = "smtp.example.it"
+smtp_port = 587
+smtp_starttls = true
+smtp_ssl = false
+smtp_user = "pecdesk@studio.example.it"
+smtp_password_env = "PECDESK_SMTP_PASSWORD"
+# smtp_password_file = "/etc/pecdesk/smtp.pw"   # permessi 600
+smtp_timeout = 30
+
+# Copia su file, utile per diagnosi e per gli archivi. Vuoto = nessuna copia.
+copia_in = "/var/lib/pecdesk/riepiloghi"
+
+# false = si scrive solo la copia su file, non si spedisce niente.
+invia = true
+
+
+[logging]
+level = "INFO"
+file = "/var/log/pecdesk/pecdesk.log"

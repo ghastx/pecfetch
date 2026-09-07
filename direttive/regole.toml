@@ -1,0 +1,178 @@
+# ---------------------------------------------------------------------------
+# Regole deterministiche di pecdesk.
+#
+# Qui stanno le CERTEZZE: mittente, dominio, casella ricevente, tipo di busta.
+# Vengono applicate in codice, senza passare dal modello, e prevalgono sul suo
+# giudizio e sulle istruzioni in linguaggio naturale.
+#
+# NON prevalgono su un veto di sicurezza: un messaggio sospetto non viene mai
+# inoltrato automaticamente, nemmeno se una regola lo direbbe. Questo file può
+# alzare il livello di attenzione, mai abbassarlo.
+#
+# Questo file sta sotto controllo di versione. Ogni esito porta la sua impronta:
+# `pecdesk registro` sa dire con quali regole è stato prodotto ogni giudizio.
+#
+# ATTENZIONE alla forma del TOML: tutto ciò che sta sotto un'intestazione di
+# tabella (come [destinatari]) appartiene a quella tabella. Le chiavi di primo
+# livello vanno quindi dichiarate qui in cima, prima di ogni intestazione.
+# ---------------------------------------------------------------------------
+
+versione = "2026-09-07"
+
+# Vocabolario chiuso dei tipi di documento. Il modello deve sceglierne uno.
+tipi_documento = [
+  "fattura",
+  "sollecito_pagamento",
+  "atto_giudiziario",
+  "cartella_esattoriale",
+  "avviso_accertamento",
+  "notifica_ente",
+  "contributi_inps",
+  "comunicazione_bancaria",
+  "contratto",
+  "pratica_edilizia",
+  "certificato_camerale",
+  "ricevuta_negativa",
+  "comunicazione_ordinaria",
+  "altro",
+]
+
+# Rete di sicurezza contro l'estratto: su questi tipi il fatto di non aver visto
+# un termine non prova che non ci sia, quindi vanno comunque al titolare.
+tipi_sempre_al_titolare = [
+  "atto_giudiziario",
+  "cartella_esattoriale",
+  "avviso_accertamento",
+]
+
+
+# ---------------------------------------------------------------------------
+# Destinatari. Il modello sceglie un ALIAS da questo elenco, mai un indirizzo:
+# così nessuna frase dentro un messaggio può far comparire un indirizzo nuovo.
+# 'titolare' è obbligatorio: è dove finisce ogni incertezza e ogni sospetto.
+# ---------------------------------------------------------------------------
+[destinatari]
+titolare = "titolare@studio.example.it"
+contabilita = "contabilita@studio.example.it"
+paghe = "paghe@studio.example.it"
+segreteria = "segreteria@studio.example.it"
+legale = "legale@studio.example.it"
+
+
+# ---------------------------------------------------------------------------
+# Parole attorno a cui si ritagliano le finestre di testo degli allegati.
+# Servono a smistare, non a leggere.
+# ---------------------------------------------------------------------------
+[parole_chiave]
+termini = [
+  "entro il", "entro e non oltre", "termine", "termini", "scadenza", "scade",
+  "ricorso", "opposizione", "impugnazione", "notifica", "notificazione",
+  "diffida", "intimazione", "sollecito", "insoluto", "morosità", "decadenza",
+  "sanzione", "sospensione", "udienza", "iban", "bonifico",
+  "coordinate bancarie", "importo", "saldo", "prescrizione",
+]
+
+
+# ---------------------------------------------------------------------------
+# Regole. Priorità alta prima; a parità, l'ordine di dichiarazione.
+#
+# Condizioni ammesse in [regola.quando]: mittente, mittente_dominio, casella,
+# cliente, tipo_pecfetch, oggetto_regex, allegato_estensione,
+# allegato_nome_regex, ha_allegati, certificato.
+# Tutte in AND; dentro una condizione, i valori in OR.
+#
+# Azioni ammesse in [regola.allora]: instradamento (titolare|studio|cliente|
+# nessuno), a (alias o indirizzo), attenzione, etichetta, salta_modello,
+# sospetto.
+# ---------------------------------------------------------------------------
+
+# Una ricevuta di rilevazione virus non si discute: la si guarda.
+[[regola]]
+id = "ricevuta-virus"
+priorita = 110
+[regola.quando]
+tipo_pecfetch = ["rilevazione_virus"]
+[regola.allora]
+instradamento = "titolare"
+attenzione = true
+sospetto = "probabile"
+etichetta = "virus"
+salta_modello = true
+
+# Riscossione: va sempre al titolare, e non c'è niente da interpretare.
+[[regola]]
+id = "agenzia-riscossione"
+priorita = 100
+[regola.quando]
+mittente_dominio = ["agenziariscossione.gov.it", "agenziaentriscossione.gov.it"]
+[regola.allora]
+instradamento = "titolare"
+attenzione = true
+etichetta = "riscossione"
+
+[[regola]]
+id = "agenzia-entrate"
+priorita = 100
+[regola.quando]
+mittente_dominio = ["agenziaentrate.it", "pce.agenziaentrate.it"]
+[regola.allora]
+instradamento = "titolare"
+attenzione = true
+etichetta = "agenzia-entrate"
+
+# Tribunali e uffici giudiziari: al titolare, sempre.
+[[regola]]
+id = "giustizia"
+priorita = 100
+[regola.quando]
+mittente_dominio = ["giustiziacert.it", "pec.giustizia.it"]
+[regola.allora]
+instradamento = "titolare"
+attenzione = true
+etichetta = "giudiziario"
+
+[[regola]]
+id = "inps-inail"
+priorita = 90
+[regola.quando]
+mittente_dominio = ["postacert.inps.gov.it", "postacert.inail.it"]
+[regola.allora]
+instradamento = "studio"
+a = "paghe"
+etichetta = "contributi"
+
+# Le ricevute negative dicono che un invio DELLO STUDIO è fallito: è un fatto,
+# non un giudizio. Non serve chiedere niente a nessuno.
+[[regola]]
+id = "ricevute-negative"
+priorita = 80
+[regola.quando]
+tipo_pecfetch = ["non_accettazione", "errore_consegna", "preavviso_errore_consegna"]
+[regola.allora]
+instradamento = "studio"
+a = "segreteria"
+attenzione = true
+etichetta = "invio-fallito"
+salta_modello = true
+
+# Fatturazione elettronica: flusso ordinario, va in contabilità.
+[[regola]]
+id = "sdi-fatture"
+priorita = 70
+[regola.quando]
+mittente_dominio = ["pec.fatturapa.it", "sdi.fatturapa.it"]
+[regola.allora]
+instradamento = "studio"
+a = "contabilita"
+etichetta = "sdi"
+
+# Esempio di regola per singolo cliente: la casella di ROSSI la segue la
+# contabilità, tranne quando scatta un veto di sicurezza.
+# [[regola]]
+# id = "cliente-rossi"
+# priorita = 10
+# [regola.quando]
+# cliente = ["ROSSI"]
+# [regola.allora]
+# instradamento = "studio"
+# a = "contabilita"
