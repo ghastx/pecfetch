@@ -216,3 +216,93 @@ def messaggio_semplice(subject="Comunicazione di servizio",
     msg["Message-ID"] = "<generico@gestore.it>"
     msg.set_content("Manutenzione programmata del servizio.")
     return msg.as_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Allegati ostili
+# ---------------------------------------------------------------------------
+
+def zip_bytes(entries, compress=True) -> bytes:
+    """Costruisce uno zip da [(nome, dati), ...]."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    mode = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    with zipfile.ZipFile(buf, "w", mode) as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def zip_encrypted(name="segreto.pdf", data=b"%PDF-1.4 dati") -> bytes:
+    """Zip che si dichiara protetto da password.
+
+    `zipfile` non sa scrivere archivi cifrati, quindi si alza a mano il bit 0
+    del campo flag negli header: a pecfetch basta e avanza, perché non deve
+    tentare di aprirlo.
+    """
+    raw = bytearray(zip_bytes([(name, data)]))
+    for signature, offset in ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8)):
+        start = raw.find(signature)
+        if start >= 0:
+            raw[start + offset] |= 0x01
+    return bytes(raw)
+
+
+def zip_bomb(size=8 * 1024 * 1024, name="fattura.txt") -> bytes:
+    """Archivio piccolo che espande molto: byte comprimibilissimi."""
+    return zip_bytes([(name, b"\0" * size)])
+
+
+def zip_annidato(livelli=4, foglia=b"testo in fondo") -> bytes:
+    """Archivi uno dentro l'altro, per provare il limite di annidamento."""
+    payload = zip_bytes([("foglia.txt", foglia)])
+    for livello in range(livelli - 1):
+        payload = zip_bytes([(f"livello{livello}.zip", payload)])
+    return payload
+
+
+def tar_bytes(entries, con_symlink=False, con_device=False) -> bytes:
+    """Tar da [(nome, dati), ...], con eventuali voci non regolari."""
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        if con_symlink:
+            link = tarfile.TarInfo("collegamento")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            tf.addfile(link)
+        if con_device:
+            dev = tarfile.TarInfo("dispositivo")
+            dev.type = tarfile.CHRTYPE
+            dev.devmajor, dev.devminor = 1, 3
+            tf.addfile(dev)
+    return buf.getvalue()
+
+
+#: bytes che qualunque sistema riconosce come eseguibile Windows
+EXE_BYTES = b"MZ\x90\x00\x03\x00\x00\x00" + b"\x00" * 64 + b"questo sarebbe codice"
+
+
+def busta_con_archivio(nome="Fatture.zip", contenuto=None, **kwargs) -> bytes:
+    """Busta di trasporto con un archivio in allegato: il caso reale."""
+    if contenuto is None:
+        contenuto = zip_bytes([
+            ("Fattura 12-2026.txt", "Imponibile 1.234,00 euro".encode()),
+            ("Fattura_2026.pdf.exe", EXE_BYTES),
+        ])
+    return busta_trasporto(
+        postacert=inner_message(
+            subject="Fatture di settembre",
+            body="In allegato le fatture.",
+            attachments=[(nome, contenuto, "octet-stream")],
+        ),
+        **kwargs,
+    )

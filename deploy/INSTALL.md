@@ -28,17 +28,18 @@ mkdir -p /etc/pecfetch /var/log/pecfetch /opt/pecfetch
 chown pecfetch:pecfetch /var/lib/pecfetch /var/log/pecfetch
 ```
 
-La cartella condivisa (`output_root`) va montata e resa scrivibile a
-`pecfetch`. Con un mount CIFS in `/etc/fstab`:
+La cartella di output va creata e resa scrivibile a `pecfetch`:
 
-```
-//nas/pec /srv/pec/condivisa cifs credentials=/etc/pecfetch/smb.cred,uid=pecfetch,gid=pecfetch,file_mode=0664,dir_mode=0775,nounix,noserverino 0 0
+```sh
+mkdir -p /srv/pec/dati
+chown pecfetch:pecfetch /srv/pec/dati
 ```
 
-`noserverino` evita inode duplicati; il rename di una cartella resta l'unico
-meccanismo su cui pecfetch conta per l'atomicità, e su CIFS funziona purché
-origine e destinazione stiano sullo stesso mount (lo staging `.tmp-pecfetch`
-sta apposta dentro `output_root`).
+I dati restano in locale e lì vengono elaborati dal componente a valle.
+L'atomicità della coda si regge su un `rename`, quindi lo staging
+`.tmp-pecfetch` deve stare sullo stesso filesystem di `output_root`: ci sta
+già dentro, quindi non c'è niente da fare finché `output_root` è una sola
+directory.
 
 ## 3. Applicazione
 

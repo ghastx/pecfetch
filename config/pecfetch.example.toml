@@ -7,11 +7,10 @@
 # ---------------------------------------------------------------------------
 
 [general]
-# Radice della cartella condivisa letta dal componente a valle (e da Windows).
-output_root = "/srv/pec/condivisa"
+# Radice dei dati prodotti, letta dal componente a valle.
+output_root = "/srv/pec/dati"
 
 # Stato locale di pecfetch: cursori UID, deduplica, diario delle esecuzioni.
-# Deve stare su disco locale della VM, non sulla condivisione.
 state_dir = "/var/lib/pecfetch"
 
 # File con le password, permessi 600, fuori dal repository.
@@ -53,11 +52,18 @@ max_chars = 200000
 
 
 [attachments]
-# Allegati più grandi di così non vengono salvati sulla condivisione, ma
-# restano censiti nell'indice e nei metadati.
+# Allegati più grandi di così non vengono salvati, ma restano censiti
+# nell'indice e nei metadati.
 max_store_bytes = 52428800     # 50 MiB
 # Allegati più grandi di così vengono salvati ma non se ne estrae il testo.
 max_extract_bytes = 26214400   # 25 MiB
+
+# Eseguibili, script, collegamenti e immagini disco non vengono mai scritti in
+# output: restano censiti nei metadati e integri dentro busta.eml. Vale sia per
+# gli allegati diretti sia per quelli dentro un archivio.
+block_active_types = true
+# Estensioni da trattare come attive oltre a quelle già previste.
+active_types_extra = []
 
 
 [extraction]
@@ -75,11 +81,26 @@ timeout = 120
 max_text_chars = 400000
 
 
+[extraction.archive]
+# Apertura degli allegati compressi. Le voci vengono lette in memoria con nomi
+# generati da pecfetch: il percorso dichiarato dentro l'archivio non viene mai
+# usato come percorso su disco. rar, 7z e le immagini disco non si aprono.
+enabled = true
+# Rapporto massimo fra byte espansi e dimensione dell'archivio ricevuto.
+max_ratio = 120
+# Totale espanso oltre il quale la lettura si ferma (annotandolo).
+max_total_bytes = 67108864     # 64 MiB
+# Numero massimo di voci, contate su tutto l'albero, non per livello.
+max_entries = 500
+# Profondità massima di annidamento (vale anche per p7m dentro archivi).
+max_depth = 3
+# Dimensione massima della singola voce.
+max_member_bytes = 33554432    # 32 MiB
+
+
 [archive]
 # Archivio storico interrogabile (SQLite + ricerca full-text).
-# Vuoto = <state_dir>/archivio.sqlite3, cioè su disco locale.
-# ATTENZIONE: metterlo sulla condivisione SMB espone al locking di CIFS,
-# che con SQLite dà corruzioni. Farlo solo sapendo cosa si rischia.
+# Vuoto = <state_dir>/archivio.sqlite3.
 path = ""
 
 

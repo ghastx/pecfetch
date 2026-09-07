@@ -56,6 +56,9 @@ class Config:
     body_max_chars: int = 200_000
     attachment_max_bytes: int = 25 * 1024 * 1024
     attachment_store_max_bytes: int = 50 * 1024 * 1024
+    #: eseguibili e script non vengono mai scritti nella cartella di output
+    block_active_types: bool = True
+    active_types_extra: tuple[str, ...] = ()
 
     extraction_enabled: bool = True
     ocr_enabled: bool = True
@@ -66,6 +69,14 @@ class Config:
     extract_timeout: int = 120
     extract_max_chars: int = 400_000
     p7m_unwrap: bool = True
+
+    #: limiti espliciti sull'apertura degli archivi
+    archive_enabled: bool = True
+    archive_max_ratio: int = 120
+    archive_max_total_bytes: int = 64 * 1024 * 1024
+    archive_max_entries: int = 500
+    archive_max_depth: int = 3
+    archive_max_member_bytes: int = 32 * 1024 * 1024
 
     source_path: Path | None = None
 
@@ -196,6 +207,7 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
     body = data.get("body", {})
     att = data.get("attachments", {})
     extr = data.get("extraction", {})
+    archive = extr.get("archive", {})
     arch = data.get("archive", {})
     logs = data.get("logging", {})
 
@@ -263,6 +275,10 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
         body_max_chars=int(body.get("max_chars", 200_000)),
         attachment_max_bytes=int(att.get("max_extract_bytes", 25 * 1024 * 1024)),
         attachment_store_max_bytes=int(att.get("max_store_bytes", 50 * 1024 * 1024)),
+        block_active_types=bool(att.get("block_active_types", True)),
+        active_types_extra=tuple(
+            str(e).lstrip(".").lower() for e in att.get("active_types_extra", [])
+        ),
         extraction_enabled=bool(extr.get("enabled", True)),
         ocr_enabled=bool(extr.get("ocr", True)),
         ocr_lang=str(extr.get("ocr_lang", "ita")),
@@ -272,6 +288,12 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
         extract_timeout=int(extr.get("timeout", 120)),
         extract_max_chars=int(extr.get("max_text_chars", 400_000)),
         p7m_unwrap=bool(extr.get("p7m_unwrap", True)),
+        archive_enabled=bool(archive.get("enabled", True)),
+        archive_max_ratio=int(archive.get("max_ratio", 120)),
+        archive_max_total_bytes=int(archive.get("max_total_bytes", 64 * 1024 * 1024)),
+        archive_max_entries=int(archive.get("max_entries", 500)),
+        archive_max_depth=int(archive.get("max_depth", 3)),
+        archive_max_member_bytes=int(archive.get("max_member_bytes", 32 * 1024 * 1024)),
         source_path=config_path,
     )
 

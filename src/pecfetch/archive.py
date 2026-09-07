@@ -5,9 +5,9 @@ la memoria di lungo periodo, quella che serve a rispondere a "cosa ci ha
 scritto questo ente su questa società negli ultimi due anni". Su file sparsi
 non si fa, quindi SQLite con FTS5.
 
-Il file sta di default nella directory di stato locale della VM, NON sulla
-condivisione: SQLite e il locking su CIFS/SMB non vanno d'accordo. Se serve
-esporlo, si sposta con `[archive].path` sapendo cosa si rischia.
+Il file sta di default nella directory di stato locale, accanto allo stato di
+pecfetch; si sposta con `[archive].path`. Se un domani finisse su un filesystem
+di rete, va tenuto presente che SQLite e il locking di rete non vanno d'accordo.
 """
 
 from __future__ import annotations

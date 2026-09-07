@@ -1,7 +1,10 @@
-"""Nomi di file e cartelle compatibili con SMB/Windows.
+"""Sanificazione dei nomi di file e cartelle.
 
-La radice di output è una condivisione letta anche da Windows: qui si sanifica.
-Il nome originale non viene mai perso, viaggia nei metadati.
+I nomi degli allegati arrivano dal mittente, quindi non sono un dato di cui
+fidarsi: qui diventano un singolo componente di percorso innocuo, che non può
+uscire dalla cartella del messaggio. Le regole tengono anche i nomi problematici
+su Windows, che non costano nulla e servono se un domani la cartella viene
+esposta. Il nome originale non viene mai perso: viaggia nei metadati.
 """
 
 from __future__ import annotations
@@ -30,8 +33,8 @@ def slugify(value: str, fallback: str = "x") -> str:
 def safe_filename(name: str, fallback: str = "allegato") -> str:
     """Sanifica un nome file conservando estensione e accenti.
 
-    Windows/SMB non ammette ``< > : " / \\ | ? *``, i caratteri di controllo,
-    i punti/spazi finali e una manciata di nomi riservati DOS.
+    Via i separatori di percorso, i caratteri di controllo, i punti e spazi
+    finali e i nomi riservati DOS: il risultato è sempre un solo componente.
     """
     name = (name or "").strip()
     name = name.replace("\r", " ").replace("\n", " ").replace("\t", " ")

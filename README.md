@@ -2,7 +2,7 @@
 
 Scarica in **sola lettura** le caselle PEC di uno studio, smonta le buste di
 trasporto e scrive il contenuto reale come dati strutturati in una cartella
-condivisa, con allegati, testo estratto dagli allegati e sorgente originale.
+locale, con allegati, testo estratto dagli allegati e sorgente originale.
 
 Non classifica, non inoltra, non scrive nulla sulle caselle e non chiama modelli
 linguistici. Produce solo dati puliti; cosa farne è di un altro componente.
@@ -12,13 +12,14 @@ linguistici. Produce solo dati puliti; cosa farne è di un altro componente.
 ## Architettura in mezza pagina
 
 ```
-        IMAP (EXAMINE + BODY.PEEK)          cartella condivisa (SMB)
+        IMAP (EXAMINE + BODY.PEEK)          cartella di output
                   |                          |
    imapclient ----+                    +---- output    coda/<messaggio>/ + indice/*.jsonl
         |                              |               esiti/  (del consumatore)
    pipeline ------ pec (parsing) ------+---- extract   testo di PDF/office/p7m, OCR ita
-        |                              |
-   state (SQLite, locale)              +---- archive   SQLite + FTS5, memoria storica
+        |                              |         |
+   state (SQLite, locale)              |      safety   tipi attivi, limiti sugli archivi
+                                       +---- archive   SQLite + FTS5, memoria storica
 ```
 
 * **`imapclient`** — `imaplib` della standard library, ma solo `EXAMINE` e
@@ -31,12 +32,15 @@ linguistici. Produce solo dati puliti; cosa farne è di un altro componente.
 * **`pec`** — riconoscimento e smontaggio delle buste: `posta-certificata`,
   `busta di anomalia`, le sette ricevute, generico. Priorità a `daticert.xml`,
   ripiego sugli header `X-*`, ultimo ripiego sull'oggetto normalizzato.
-* **`output`** — scrittura sulla condivisione: montaggio in `.tmp-pecfetch`,
+* **`output`** — scrittura dei dati: montaggio in `.tmp-pecfetch`,
   `rename` atomico dentro `coda/`, riga JSONL in append nell'indice del giorno.
 * **`extract`** — testo degli allegati: PDF nativo (pdftotext/pypdf/pdfminer),
-  ripiego OCR in italiano per gli atti scansionati, docx/xlsx/pptx/odf con la
-  sola standard library, sbustamento CAdES `.p7m`. Ogni dipendenza è opzionale
-  e caricata lazy: se manca, il messaggio esce lo stesso con l'esito annotato.
+  ripiego OCR in italiano per gli atti scansionati, docx/xlsx/pptx/odf e archivi
+  con la sola standard library, sbustamento CAdES `.p7m`. Ogni dipendenza è
+  opzionale e caricata lazy: se manca, il messaggio esce lo stesso con l'esito
+  annotato.
+* **`safety`** — le regole su cosa si apre e cosa si scrive: tipi attivi, limiti
+  sugli archivi, XML senza dichiarazioni di entità. Vedi più sotto.
 * **`archive`** — SQLite con FTS5, gli stessi record dell'indice, per la
   ricerca retrospettiva per cliente, mittente, periodo e testo.
 * **`pipeline`** — orchestrazione, gestione degli errori per casella,
@@ -87,7 +91,7 @@ coda/<messaggio>/          messaggio.json  metadati completi
                            daticert.xml    metadati certificati del gestore
 esiti/                     riservata al consumatore, append-only, pecfetch non tocca
 .tmp-pecfetch/             area di montaggio, da ignorare
-CONTRATTO.md               questa stessa descrizione, scritta nella condivisa
+CONTRATTO.md               questa stessa descrizione, scritta nella radice
 ```
 
 Un record d'indice porta: casella ricevente ed etichetta leggibile, cliente,
@@ -142,18 +146,59 @@ Installazione e configurazione: [`deploy/INSTALL.md`](deploy/INSTALL.md) e
 * **Indice in JSONL giornaliero.** Un record per riga, indipendente, in append
   senza lock; un giorno intero si legge in blocco. Niente file monolitico con
   dentro anche i contenuti.
-* **L'archivio storico sta su disco locale**, non sulla condivisione. SQLite e
-  il locking CIFS/SMB si corrompono a vicenda. È configurabile
-  (`[archive].path`) per chi vuole spostarlo sapendo cosa rischia.
+* **L'archivio storico è un SQLite accanto allo stato**, configurabile con
+  `[archive].path`.
 * **Sbustamento `.p7m`.** Non era nel testo, ma sulle PEC di lavoro gli atti
   degli enti arrivano quasi sempre firmati CAdES: senza sbustare, l'estrazione
   del testo fallisce proprio sui documenti che contano.
-* **Nome della cartella leggibile**: `data_casella_oggetto_id`. La condivisione
-  la aprono anche esseri umani da Windows.
+* **Nome della cartella leggibile**: `data_casella_oggetto_id`. Le cartelle le
+  aprono anche esseri umani.
 * **Valvola di sicurezza sui messaggi problematici**: dopo tre tentativi
   falliti sullo stesso messaggio, viene scritto comunque senza estrazione del
   testo, con la nota nei metadati. Meglio un messaggio incompleto in coda che
   una casella bloccata per sempre su un PDF malato.
+
+## Allegati ostili
+
+`extract` apre per mestiere file che arrivano da mittenti sconosciuti: sulle
+caselle PEC girano campagne ricorrenti di finte fatture con allegato compresso,
+spedite da caselle certificate compromesse. Le regole stanno in `safety.py`.
+
+* **Non si esegue niente, mai.** Niente LibreOffice, niente interpreti: i
+  formati office si smontano come ZIP + XML, quindi nessuna macro viene
+  attivata. I `.docm`/`.xlsm` si leggono, ma escono marcati `contenuto_attivo`.
+* **Eseguibili e script non vengono mai scritti su disco.** Vale per gli
+  allegati diretti e per le voci degli archivi. Restano censiti nei metadati
+  (nome, tipo, dimensione, sha256) e integri dentro `busta.eml`. Vale il
+  contenuto, non l'estensione: un `fattura.pdf` che comincia per `MZ` è un
+  eseguibile travestito, e viene trattato come tale.
+* **Gli archivi si aprono con limiti espliciti** su rapporto di espansione,
+  byte totali, numero di voci, annidamento e dimensione della singola voce
+  (`[extraction.archive]`). I contatori sono condivisi da tutto l'albero, non
+  per livello. Le voci si leggono a blocchi, senza fidarsi della dimensione
+  dichiarata nell'header. Al superamento di un limite la lettura si ferma e
+  `limite_superato` dice quale.
+* **Il percorso dichiarato dentro un archivio non è un percorso.** Le voci
+  finiscono in `allegati/<archivio>.d/NNN_<nome>` con nomi generati da pecfetch;
+  il percorso originale resta nei metadati come dato. `../../etc/passwd` diventa
+  `001_passwd`.
+* **`rar`, `7z` e le immagini disco non si aprono**: sono i formati che il
+  malspam usa per evadere i controlli, e non aprirli è la risposta giusta.
+  Escono come `unsupported_archive`.
+* **XML senza DTD.** `daticert.xml` e i formati office si parsano rifiutando le
+  dichiarazioni di entità: la protezione di expat contro l'amplificazione
+  dipende dalla versione installata e non ci si appoggia. Un daticert con DTD
+  ricade sul ripiego a regex e i metadati certificati si recuperano lo stesso.
+
+Niente di tutto questo può far mancare un messaggio: un allegato che non si è
+potuto trattare produce un messaggio **annotato**, non un messaggio assente.
+
+**Limite dichiarato**: non c'è confinamento di processo. Gli strumenti esterni
+(`pdftotext`, `pdftoppm`, `tesseract`, `openssl`) girano con un timeout ma senza
+limiti di memoria e senza sandbox. Un PDF costruito per sfruttare un bug di
+memoria in poppler eseguirebbe codice come utente `pecfetch`, dentro il
+perimetro dell'unit systemd. È l'attacco mirato che il progetto dichiara fuori
+scopo; se un domani lo si vuole coprire, il punto d'innesto è `extract._run`.
 
 ## Sviluppo
 

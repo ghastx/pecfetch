@@ -1,4 +1,4 @@
-"""Scrittura del contratto di output sulla cartella condivisa.
+"""Scrittura del contratto di output.
 
 Due livelli, come richiesto dal consumatore che lavora in due passate:
 
@@ -11,7 +11,13 @@ Regole di scrittura:
     e si sposta con un rename sulla stessa unità;
   * il corpo sta in un file di testo a sé (``corpo.txt``), mai annegato in JSON;
   * l'indice si accresce in append, una riga per messaggio, senza lock;
-  * ``esiti/`` è del consumatore: pecfetch la crea e non la tocca mai più.
+  * ``esiti/`` è del consumatore: pecfetch la crea e non la tocca mai più;
+  * eseguibili e script non vengono mai scritti: restano censiti nei metadati e
+    integri dentro ``busta.eml``.
+
+I nomi dei file vengono sanificati: non per compatibilità con altri sistemi, ma
+perché un nome che arriva dal mittente non deve mai poter uscire dalla cartella
+del messaggio.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from zoneinfo import ZoneInfo
 from . import __version__
 from .extract import ExtractorSettings, extract_text
 from .naming import safe_filename, slugify, unique_filename
+from .safety import classify_file
 from .pec import ParsedMessage, certified_or_best_date, receipt_class
 
 SCHEMA_INDEX = "pecfetch/indice/1"
@@ -58,7 +65,7 @@ class WriteResult:
 
 
 class OutputWriter:
-    """Unico punto di scrittura sulla cartella condivisa."""
+    """Unico punto di scrittura sulla cartella di output."""
 
     def __init__(self, root: Path, settings: ExtractorSettings,
                  body_max_chars: int = 200_000,
@@ -203,6 +210,10 @@ class OutputWriter:
         taken: set[str] = set()
         attachments_meta: list[dict] = []
         extracted_texts: list[str] = []
+        settings = self.settings
+        if not extraction:
+            settings = replace(self.settings, enabled=False)
+
         for att in pm.attachments:
             stored_name = unique_filename(att.filename or "allegato", taken)
             entry: dict = {
@@ -215,20 +226,32 @@ class OutputWriter:
             }
             if att.inline:
                 entry["inline"] = True
+
+            verdict = classify_file(att.filename, att.content_type, att.payload,
+                                    settings.active_extra)
+            if verdict.macro_enabled:
+                entry["contenuto_attivo"] = True
+            if verdict.suspicious:
+                entry["contenuto_sospetto"] = True
+                entry["nota"] = verdict.reason
+
+            # Un tipo attivo non viene mai scritto su disco: resta censito qui e
+            # integro dentro busta.eml, dove non può essere raggiunto per sbaglio.
+            if verdict.active and settings.block_active_types:
+                entry["contenuto_attivo"] = True
+                self._not_stored(entry, f"tipo attivo: {verdict.reason}",
+                                 "blocked_type")
+                attachments_meta.append(entry)
+                continue
+
             if att.size > self.attachment_store_max_bytes:
-                entry["salvato"] = False
-                entry["motivo"] = "oltre la soglia di salvataggio"
-                entry.pop("percorso", None)
-                entry["testo"] = {"method": "none", "status": "skipped_too_large",
-                                  "chars": 0}
+                self._not_stored(entry, "oltre la soglia di salvataggio",
+                                 "skipped_too_large")
                 attachments_meta.append(entry)
                 continue
 
             (staging / DIR_ATTACHMENTS / stored_name).write_bytes(att.payload)
             entry["salvato"] = True
-            settings = self.settings
-            if not extraction:
-                settings = replace(self.settings, enabled=False)
             result = extract_text(att.payload, att.filename, att.content_type,
                                   settings)
             entry["testo"] = result.as_dict()
@@ -239,6 +262,11 @@ class OutputWriter:
                     result.text, encoding="utf-8"
                 )
                 entry["testo"]["percorso"] = f"{DIR_ATTACHMENTS}/{text_name}"
+
+            if result.members:
+                entry["archivio"] = self._write_members(
+                    staging, stored_name, result, extracted_texts
+                )
             attachments_meta.append(entry)
 
         record = self._index_record(
@@ -250,6 +278,61 @@ class OutputWriter:
             json.dumps(metadata, ensure_ascii=False, indent=1), encoding="utf-8"
         )
         return record, {"corpo": body, "allegati": "\n".join(extracted_texts)}
+
+    @staticmethod
+    def _not_stored(entry: dict, motivo: str, stato: str) -> None:
+        """L'allegato non finisce su disco, ma resta censito per intero."""
+        entry["salvato"] = False
+        entry["motivo"] = motivo
+        entry.pop("percorso", None)
+        entry.pop("nome_file", None)
+        entry["testo"] = {"method": "none", "status": stato, "chars": 0}
+
+    def _write_members(self, staging: Path, stored_name: str, result,
+                       extracted_texts: list[str]) -> dict:
+        """Scrive le voci idonee di un archivio.
+
+        Due regole, entrambe non negoziabili: il nome sul disco lo generiamo
+        noi, numerato progressivamente, e il percorso dichiarato dentro
+        l'archivio finisce solo nei metadati come dato — mai come percorso.
+        """
+        member_dir = safe_filename(f"{stored_name}.d")
+        target = staging / DIR_ATTACHMENTS / member_dir
+        target.mkdir(parents=True, exist_ok=True)
+
+        member_taken: set[str] = set()
+        membri: list[dict] = []
+        scritti = 0
+        for position, (declared, member) in enumerate(_leaf_members(result.members), 1):
+            meta = member.as_dict()
+            meta["percorso_dichiarato"] = declared
+            if member.stored and member.data:
+                name = unique_filename(f"{position:03d}_{member.name}", member_taken)
+                (target / name).write_bytes(member.data)
+                scritti += 1
+                meta["nome_file"] = name
+                meta["percorso"] = f"{DIR_ATTACHMENTS}/{member_dir}/{name}"
+                text = member.result.text if member.result is not None else ""
+                if text:
+                    extracted_texts.append(text)
+                    (target / f"{name}.txt").write_text(text, encoding="utf-8")
+                    meta.setdefault("testo", {})["percorso"] = (
+                        f"{DIR_ATTACHMENTS}/{member_dir}/{name}.txt"
+                    )
+            else:
+                meta["salvato"] = False
+            membri.append(meta)
+
+        if not scritti:
+            # niente da materializzare: non si lascia in giro una cartella vuota
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+
+        report = result.archive.as_dict() if result.archive is not None else {}
+        return {**report, "cartella": f"{DIR_ATTACHMENTS}/{member_dir}",
+                "membri": membri}
 
     def _index_record(self, pm: ParsedMessage, account, msg_id: str,
                       uidvalidity: int, uid: int, fetched_at: str, dir_name: str,
@@ -289,6 +372,9 @@ class OutputWriter:
                     "testo": a.get("testo", {}).get("status", ""),
                     "metodo": a.get("testo", {}).get("method", ""),
                     "caratteri": a.get("testo", {}).get("chars", 0),
+                    **({"salvato": False} if a.get("salvato") is False else {}),
+                    **({"voci": len(a["archivio"].get("membri", []))}
+                       if "archivio" in a else {}),
                 }
                 for a in attachments_meta
             ],
@@ -357,6 +443,20 @@ class OutputWriter:
         return meta
 
 
+def _leaf_members(members, prefix: str = ""):
+    """Appiattisce l'albero delle voci: si materializzano solo le foglie.
+
+    Un archivio annidato non viene riscritto come file: si scrivono le sue voci.
+    """
+    for member in members:
+        declared = f"{prefix}{member.declared_path or member.name}"
+        nested = member.result.members if member.result is not None else []
+        if nested:
+            yield from _leaf_members(nested, f"{declared}/")
+        else:
+            yield declared, member
+
+
 def _iso(value) -> str | None:
     if value is None:
         return None
@@ -404,6 +504,8 @@ tranne `esiti/` che è del consumatore.
         corpo.txt             corpo del messaggio, testo normalizzato
         allegati/<file>       allegato con il nome originale sanificato
         allegati/<file>.txt   testo estratto dall'allegato (quando ricavabile)
+        allegati/<file>.d/    voci estratte da un allegato compresso,
+                              rinominate NNN_<nome> da pecfetch
         busta.eml             sorgente originale integrale
         postacert.eml         messaggio interno alla busta di trasporto
         daticert.xml          metadati certificati del gestore
@@ -428,7 +530,39 @@ tranne `esiti/` che è del consumatore.
 * Il testo degli allegati riporta metodo ed esito dell'estrazione
   (`allegati[].metodo`, `allegati[].testo`): `pdf_ocr` significa OCR, quindi
   testo potenzialmente incerto.
+
+## Allegati che non sono stati scritti
+
+Un allegato con `"salvato": false` esiste, ma il suo file non è stato creato.
+Il campo `motivo` dice perché, e il contenuto integrale resta dentro
+`busta.eml`. Succede in tre casi:
+
+* **tipo attivo** — eseguibili, script, collegamenti, immagini disco. Non
+  vengono mai materializzati, né come allegato diretto né dall'interno di un
+  archivio: `"contenuto_attivo": true`. Se il nome mentiva sul contenuto (un
+  `.pdf` che comincia per `MZ`) c'è anche `"contenuto_sospetto": true`.
+* **oltre la soglia di salvataggio** — allegato troppo grande.
+* **tipo da cui non si ricava testo**, per le sole voci interne agli archivi.
+
+I documenti office con macro vengono invece salvati e letti (si smontano come
+ZIP + XML, nessuna macro viene eseguita) ma sono marcati `contenuto_attivo`.
+
+## Archivi
+
+Un allegato compresso porta un campo `archivio` con il censimento completo:
+formato, numero di voci, byte espansi, rapporto di espansione, e per ogni voce
+il `percorso_dichiarato` così com'era scritto **dentro** l'archivio. Quel
+percorso è un dato, non un percorso: i file veri stanno in `allegati/<file>.d/`
+con nomi generati da pecfetch.
+
+Se un limite scatta (rapporto di espansione, byte totali, numero di voci,
+annidamento), la lettura si ferma, `limite_superato` dice quale, e quello che si
+era già letto resta valido. `rar`, `7z` e le immagini disco non vengono aperti
+per scelta: `unsupported_archive`.
+
+In nessuno di questi casi il messaggio manca: esce comunque, annotato.
 """
+
 
 _OUTCOMES_README = """# esiti/
 

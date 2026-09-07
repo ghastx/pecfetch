@@ -397,3 +397,46 @@ def test_sequenza_completa_realistica(cfg, stack, make_pipeline):
     stati = {r["uid"]: r["status"] for r in state.db.execute("SELECT uid, status FROM messages")}
     assert stati == {1: STATUS_DONE, 2: STATUS_SKIPPED, 3: STATUS_SKIPPED,
                      4: STATUS_DONE, 5: STATUS_DONE, 6: STATUS_DONE}
+
+
+def test_allegato_ostile_non_fa_mancare_il_messaggio(cfg, stack, make_pipeline):
+    """La regola che conta: annotato, non assente."""
+    box = FakeMailbox()
+    box.add(f.busta_con_archivio("Fatture.zip", f.zip_bytes([
+        ("Fattura 12.txt", "Imponibile 1.234,00 euro".encode()),
+        ("Fattura_2026.pdf.exe", f.EXE_BYTES),
+    ])), _oggi())
+    box.add(f.busta_con_archivio("bomba.zip", f.zip_bomb(size=4 * 1024 * 1024)),
+            _oggi())
+    box.add(f.busta_con_archivio("protetto.zip", f.zip_encrypted()), _oggi())
+    box.add(f.busta_trasporto(postacert=f.inner_message(
+        subject="Solo un eseguibile",
+        attachments=[("aggiornamento.exe", f.EXE_BYTES, "octet-stream")])), _oggi())
+
+    summary = make_pipeline({"rossi": box}).run(MODE_RUN)
+
+    assert summary.accounts_err == 0
+    assert summary.written == 4          # nessun messaggio perso
+    assert len(_coda(cfg)) == 4
+    righe = _righe_indice(cfg)
+    assert len(righe) == 4
+
+    stati = {r["allegati"][0]["nome"]: r["allegati"][0]["testo"] for r in righe}
+    assert stati["bomba.zip"] == "archive_limit"
+    assert stati["protetto.zip"] == "encrypted"
+    assert stati["aggiornamento.exe"] == "blocked_type"
+
+    # nessun eseguibile sciolto da nessuna parte sotto la radice
+    for percorso in (cfg.output_root / "coda").rglob("*"):
+        assert not percorso.name.lower().endswith((".exe", ".bat", ".js", ".vbs"))
+
+
+def test_archivio_full_text_indicizza_le_voci(cfg, stack, make_pipeline):
+    archive = stack[1]
+    box = FakeMailbox()
+    box.add(f.busta_con_archivio("Fatture.zip", f.zip_bytes([
+        ("Cartella esattoriale.txt", "Iscrizione a ruolo per omesso versamento".encode()),
+    ])), _oggi())
+    make_pipeline({"rossi": box}).run(MODE_RUN)
+    assert archive.search(query="esattoriale")
+    assert archive.search(query="ruolo")

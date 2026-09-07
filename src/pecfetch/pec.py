@@ -23,6 +23,7 @@ from email import message_from_bytes
 from email.message import Message
 from xml.etree import ElementTree
 
+from .safety import UnsafeXML, safe_xml_fromstring
 from .mimeutil import (
     address_list_of,
     decode_bytes,
@@ -186,13 +187,17 @@ def parse_daticert(raw: bytes) -> DatiCert | None:
     root = None
     try:
         # Dai bytes: così la dichiarazione <?xml encoding=...?> resta valida.
-        root = ElementTree.fromstring(raw.lstrip(b"\xef\xbb\xbf \r\n\t"))
+        # safe_xml_fromstring rifiuta DTD e dichiarazioni di entità: daticert.xml
+        # non ne ha mai, e un XML che ne porta ricade sul ripiego a regex.
+        root = safe_xml_fromstring(raw.lstrip(b"\xef\xbb\xbf \r\n\t"))
+    except UnsafeXML:
+        return _daticert_fallback(raw, dc)
     except Exception:
         try:
             text = decode_bytes(raw, None).lstrip("﻿ \r\n\t")
             # ElementTree rifiuta una str con dichiarazione di encoding.
             text = re.sub(r"^<\?xml[^>]*\?>", "", text).strip()
-            root = ElementTree.fromstring(text)
+            root = safe_xml_fromstring(text.encode("utf-8", "replace"))
         except Exception:
             return _daticert_fallback(raw, dc)
 

@@ -20,12 +20,24 @@ import re
 import shutil
 import subprocess
 import tempfile
-import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from xml.etree import ElementTree
 
 from .mimeutil import decode_bytes, html_to_text, normalize_text
+from .safety import (
+    ARCHIVE_CONTENT_TYPES,
+    ARCHIVE_EXTENSIONS,
+    OPAQUE_ARCHIVE_EXTENSIONS,
+    ArchiveBudget,
+    ArchiveLimits,
+    ArchiveReport,
+    archive_kind,
+    classify_file,
+    is_extractable,
+    open_office_zip,
+    read_archive,
+    safe_xml_fromstring,
+)
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +48,14 @@ STATUS_TOO_LARGE = "skipped_too_large"
 STATUS_UNSUPPORTED = "unsupported"
 STATUS_TOOL_MISSING = "tool_missing"
 STATUS_DISABLED = "disabled"
+#: tipo attivo: non si apre e non si scrive su disco
+STATUS_BLOCKED = "blocked_type"
+#: un limite sull'archivio è scattato: quel che si è letto resta valido
+STATUS_ARCHIVE_LIMIT = "archive_limit"
+#: archivio protetto da password: nessun tentativo
+STATUS_ENCRYPTED = "encrypted"
+#: rar, 7z, iso: non li apriamo per scelta
+STATUS_OPAQUE_ARCHIVE = "unsupported_archive"
 
 _TEXT_EXT = {".txt", ".csv", ".log", ".md", ".asc", ".json", ".ini", ".cfg", ".dat"}
 _XML_EXT = {".xml", ".xsd", ".xsl"}
@@ -47,6 +67,30 @@ OCR_TRIGGER_CHARS = 32
 
 
 @dataclass
+class MemberResult:
+    """Una voce di archivio, col suo esito e i suoi byte se materializzabile."""
+
+    declared_path: str          # com'era scritto DENTRO l'archivio: solo un dato
+    name: str                   # nome base sanificato
+    content_type: str = ""
+    data: bytes = field(repr=False, default=b"")
+    stored: bool = False        # va materializzata come file?
+    reason: str = ""            # perché no
+    result: "ExtractionResult | None" = None
+
+    def as_dict(self) -> dict:
+        out = {"percorso_dichiarato": self.declared_path, "nome": self.name,
+               "byte": len(self.data), "salvato": self.stored}
+        if self.content_type:
+            out["content_type"] = self.content_type
+        if self.reason:
+            out["motivo"] = self.reason
+        if self.result is not None:
+            out["testo"] = self.result.as_dict()
+        return out
+
+
+@dataclass
 class ExtractionResult:
     text: str = ""
     method: str = "none"
@@ -54,6 +98,8 @@ class ExtractionResult:
     error: str = ""
     truncated: bool = False
     pages: int = 0
+    members: list[MemberResult] = field(default_factory=list)
+    archive: ArchiveReport | None = None
 
     @property
     def chars(self) -> int:
@@ -67,6 +113,10 @@ class ExtractionResult:
             out["pages"] = self.pages
         if self.error:
             out["error"] = self.error[:300]
+        if self.archive is not None:
+            out["archivio"] = self.archive.as_dict()
+        if self.members:
+            out["voci"] = len(self.members)
         return out
 
 
@@ -82,6 +132,11 @@ class ExtractorSettings:
     max_bytes: int = 25 * 1024 * 1024
     max_chars: int = 400_000
     p7m_unwrap: bool = True
+    block_active_types: bool = True
+    active_extra: frozenset[str] = frozenset()
+    archive: ArchiveLimits = field(default_factory=ArchiveLimits)
+    #: profondità massima di annidamento fra p7m, archivi ed eml
+    max_depth: int = 3
 
     @classmethod
     def from_config(cls, cfg) -> "ExtractorSettings":
@@ -96,6 +151,17 @@ class ExtractorSettings:
             max_bytes=cfg.attachment_max_bytes,
             max_chars=cfg.extract_max_chars,
             p7m_unwrap=cfg.p7m_unwrap,
+            block_active_types=cfg.block_active_types,
+            active_extra=frozenset(cfg.active_types_extra),
+            archive=ArchiveLimits(
+                enabled=cfg.archive_enabled,
+                max_ratio=cfg.archive_max_ratio,
+                max_total_bytes=cfg.archive_max_total_bytes,
+                max_entries=cfg.archive_max_entries,
+                max_depth=cfg.archive_max_depth,
+                max_member_bytes=cfg.archive_max_member_bytes,
+            ),
+            max_depth=cfg.archive_max_depth,
         )
 
 
@@ -290,72 +356,89 @@ def _tesseract(image: bytes, settings: ExtractorSettings) -> tuple[str, str]:
 _XML_TAG_RE = re.compile(r"<[^>]+>")
 
 
-def _zip_xml_text(data: bytes, members: list[str], para_tags: tuple[str, ...]) -> str:
+def _office_members(data: bytes, settings: ExtractorSettings) -> tuple[dict, str]:
+    """Membri di un file office, con gli stessi limiti degli archivi.
+
+    I formati office SONO archivi ZIP: la bomba di decompressione è la stessa,
+    e la guardia dev'essere la stessa.
+    """
+    return open_office_zip(data, settings.archive)
+
+
+def _zip_xml_text(data: bytes, settings: ExtractorSettings, members: list[str],
+                  para_tags: tuple[str, ...]) -> str:
+    files, limit = _office_members(data, settings)
+    if not files and limit:
+        raise ValueError(f"limite sull'archivio: {limit}")
     out: list[str] = []
-    import io
+    for member in members:
+        if member.endswith("*"):
+            targets = sorted(n for n in files if n.startswith(member[:-1]))
+        else:
+            targets = [member] if member in files else []
+        for target in targets:
+            text = decode_bytes(files[target], "utf-8")
+            for tag in para_tags:
+                text = re.sub(rf"</{tag}>", "\n", text)
+            text = _XML_TAG_RE.sub("", text)
+            import html as html_mod
 
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = set(zf.namelist())
-        for member in members:
-            if member.endswith("*"):
-                targets = sorted(n for n in names if n.startswith(member[:-1]))
-            else:
-                targets = [member] if member in names else []
-            for target in targets:
-                raw = zf.read(target)
-                text = decode_bytes(raw, "utf-8")
-                for tag in para_tags:
-                    text = re.sub(rf"</{tag}>", "\n", text)
-                text = _XML_TAG_RE.sub("", text)
-                import html as html_mod
-
-                out.append(html_mod.unescape(text))
+            out.append(html_mod.unescape(text))
+    if limit:
+        out.append(f"\n[…lettura interrotta da pecfetch: {limit}]")
     return "\n".join(out)
 
 
-def _docx(data: bytes) -> str:
-    return _zip_xml_text(data, ["word/document.xml"], ("w:p", "w:br", "w:tr"))
+def _docx(data: bytes, settings: ExtractorSettings) -> str:
+    return _zip_xml_text(data, settings, ["word/document.xml"],
+                         ("w:p", "w:br", "w:tr"))
 
 
-def _pptx(data: bytes) -> str:
-    return _zip_xml_text(data, ["ppt/slides/slide*"], ("a:p", "a:br"))
+def _pptx(data: bytes, settings: ExtractorSettings) -> str:
+    return _zip_xml_text(data, settings, ["ppt/slides/slide*"], ("a:p", "a:br"))
 
 
-def _odf(data: bytes) -> str:
-    return _zip_xml_text(data, ["content.xml"], ("text:p", "text:h", "table:table-row"))
+def _odf(data: bytes, settings: ExtractorSettings) -> str:
+    return _zip_xml_text(data, settings, ["content.xml"],
+                         ("text:p", "text:h", "table:table-row"))
 
 
-def _xlsx(data: bytes) -> str:
+def _xlsx(data: bytes, settings: ExtractorSettings) -> str:
     """Fogli di calcolo: valori delle celle, un foglio per blocco."""
-    import io
-
     ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = zf.namelist()
-        shared: list[str] = []
-        if "xl/sharedStrings.xml" in names:
-            root = ElementTree.fromstring(zf.read("xl/sharedStrings.xml"))
-            for si in root.findall(f"{ns}si"):
-                shared.append("".join(t.text or "" for t in si.iter(f"{ns}t")))
-        out: list[str] = []
-        for sheet in sorted(n for n in names if re.match(r"xl/worksheets/sheet\d+\.xml$", n)):
-            root = ElementTree.fromstring(zf.read(sheet))
-            out.append(f"--- {sheet.rsplit('/', 1)[-1]} ---")
-            for row in root.iter(f"{ns}row"):
-                cells: list[str] = []
-                for cell in row.findall(f"{ns}c"):
-                    value = cell.find(f"{ns}v")
-                    text = value.text if value is not None else ""
-                    if cell.get("t") == "s" and text and text.isdigit():
-                        idx = int(text)
-                        text = shared[idx] if 0 <= idx < len(shared) else ""
-                    elif cell.get("t") == "inlineStr":
-                        node = cell.find(f"{ns}is")
-                        text = "".join(t.text or "" for t in node.iter(f"{ns}t")) if node is not None else ""
-                    cells.append((text or "").strip())
-                if any(cells):
-                    out.append("\t".join(cells))
-        return "\n".join(out)
+    files, limit = _office_members(data, settings)
+    if not files and limit:
+        raise ValueError(f"limite sull'archivio: {limit}")
+
+    shared: list[str] = []
+    if "xl/sharedStrings.xml" in files:
+        root = safe_xml_fromstring(files["xl/sharedStrings.xml"])
+        for si in root.findall(f"{ns}si"):
+            shared.append("".join(t.text or "" for t in si.iter(f"{ns}t")))
+
+    out: list[str] = []
+    for sheet in sorted(n for n in files
+                        if re.match(r"xl/worksheets/sheet\d+\.xml$", n)):
+        root = safe_xml_fromstring(files[sheet])
+        out.append(f"--- {sheet.rsplit('/', 1)[-1]} ---")
+        for row in root.iter(f"{ns}row"):
+            cells: list[str] = []
+            for cell in row.findall(f"{ns}c"):
+                value = cell.find(f"{ns}v")
+                text = value.text if value is not None else ""
+                if cell.get("t") == "s" and text and text.isdigit():
+                    idx = int(text)
+                    text = shared[idx] if 0 <= idx < len(shared) else ""
+                elif cell.get("t") == "inlineStr":
+                    node = cell.find(f"{ns}is")
+                    text = ("".join(t.text or "" for t in node.iter(f"{ns}t"))
+                            if node is not None else "")
+                cells.append((text or "").strip())
+            if any(cells):
+                out.append("\t".join(cells))
+    if limit:
+        out.append(f"\n[…lettura interrotta da pecfetch: {limit}]")
+    return "\n".join(out)
 
 
 def _eml(data: bytes) -> str:
@@ -379,6 +462,99 @@ def _eml(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Archivi
+#
+# Sulle PEC la finta fattura arriva quasi sempre in uno zip. Si apre, ma con
+# limiti espliciti su rapporto di espansione, byte totali, numero di voci e
+# annidamento; e da dentro esce solo ciò da cui ha senso ricavare testo.
+# ---------------------------------------------------------------------------
+
+def _guess_type(name: str) -> str:
+    import mimetypes
+
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _is_archive(ext: str, ctype: str, data: bytes) -> bool:
+    return (
+        ext in ARCHIVE_EXTENSIONS
+        or ext in OPAQUE_ARCHIVE_EXTENSIONS
+        or ctype in ARCHIVE_CONTENT_TYPES
+        or bool(archive_kind("", data))
+    )
+
+
+def _archive(data: bytes, filename: str, settings: ExtractorSettings,
+             depth: int, budget: ArchiveBudget | None) -> ExtractionResult:
+    limits = settings.archive
+    if not limits.enabled:
+        return ExtractionResult(status=STATUS_DISABLED, method="archive")
+
+    kind = archive_kind(filename, data)
+    if kind == "opaque":
+        # rar, 7z, iso: sono proprio i formati che il malspam usa per evadere
+        # i controlli. Non aprirli è la risposta giusta, non una rinuncia.
+        return ExtractionResult(
+            status=STATUS_OPAQUE_ARCHIVE, method="archive",
+            error="formato non aperto per scelta: il contenuto resta in busta.eml",
+        )
+
+    if budget is None:
+        budget = limits.budget(len(data))
+    members, report = read_archive(data, filename, budget, depth)
+
+    out: list[MemberResult] = []
+    sections: list[str] = []
+    for member in members:
+        ctype = _guess_type(member.name)
+        entry = MemberResult(declared_path=member.declared_path, name=member.name,
+                             content_type=ctype)
+        if member.skipped:
+            entry.reason = member.skipped
+        else:
+            verdict = classify_file(member.name, ctype, member.data,
+                                    settings.active_extra)
+            if verdict.active and settings.block_active_types:
+                entry.reason = verdict.reason
+                entry.result = ExtractionResult(status=STATUS_BLOCKED,
+                                                method="none", error=verdict.reason)
+            elif not is_extractable(member.name):
+                entry.reason = "tipo da cui non si ricava testo"
+                entry.result = ExtractionResult(status=STATUS_UNSUPPORTED,
+                                                method="none")
+            else:
+                entry.data = member.data
+                entry.stored = True
+                entry.result = extract_text(member.data, member.name, ctype,
+                                            settings, depth + 1, budget)
+        out.append(entry)
+
+        label = member.declared_path or member.name
+        if entry.result is not None and entry.result.text:
+            sections.append(f"=== {label} ===\n{entry.result.text}")
+        elif entry.reason:
+            sections.append(f"=== {label} === [non trattato: {entry.reason}]")
+
+    result = ExtractionResult(text="\n\n".join(sections),
+                              method=f"archive_{kind}", members=out,
+                              archive=report)
+    result = _cap(result, settings)
+    # Le righe "[non trattato: ...]" sono annotazioni, non contenuto: lo stato
+    # deve dipendere dal testo davvero ricavato dalle voci.
+    has_content = any(m.result is not None and m.result.text for m in out)
+    if report.stopped:
+        result.status = STATUS_ARCHIVE_LIMIT
+        result.error = report.stopped
+    elif report.encrypted and not has_content:
+        result.status = STATUS_ENCRYPTED
+        result.error = "archivio protetto da password: nessun tentativo"
+    elif report.error and not has_content:
+        result.status = STATUS_FAILED
+        result.error = report.error
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -387,7 +563,8 @@ def _ext(filename: str) -> str:
 
 
 def extract_text(data: bytes, filename: str, content_type: str,
-                 settings: ExtractorSettings, depth: int = 0) -> ExtractionResult:
+                 settings: ExtractorSettings, depth: int = 0,
+                 budget: ArchiveBudget | None = None) -> ExtractionResult:
     """Estrae il testo di un allegato. Non solleva mai."""
     if not settings.enabled:
         return ExtractionResult(status=STATUS_DISABLED, method="none")
@@ -400,9 +577,21 @@ def extract_text(data: bytes, filename: str, content_type: str,
     ext = _ext(filename)
     ctype = (content_type or "").lower()
 
+    # Un tipo attivo non si apre nemmeno: non c'è testo da ricavarne, e non lo
+    # si passa a un parser solo per scoprirlo.
+    if settings.block_active_types:
+        verdict = classify_file(filename, content_type, data, settings.active_extra)
+        if verdict.active:
+            return ExtractionResult(status=STATUS_BLOCKED, method="none",
+                                    error=verdict.reason)
+
+    if depth > settings.max_depth:
+        return ExtractionResult(status=STATUS_ARCHIVE_LIMIT, method="none",
+                                error=f"annidamento oltre {settings.max_depth} livelli")
+
     try:
         # Busta di firma digitale: si sbuccia e si riparte sul contenuto.
-        if depth < 3 and settings.p7m_unwrap and (
+        if depth < settings.max_depth and settings.p7m_unwrap and (
             ext == ".p7m"
             or ctype in ("application/pkcs7-mime", "application/x-pkcs7-mime")
         ):
@@ -411,7 +600,8 @@ def extract_text(data: bytes, filename: str, content_type: str,
                 return ExtractionResult(status=STATUS_FAILED, method="p7m",
                                         error=err or "sbustamento fallito")
             inner_name = filename[: -len(ext)] if ext == ".p7m" else filename
-            result = extract_text(inner, inner_name, "", settings, depth + 1)
+            result = extract_text(inner, inner_name, "", settings, depth + 1,
+                                  budget)
             result.method = f"p7m+{result.method}"
             return _cap(result, settings)
 
@@ -442,13 +632,16 @@ def extract_text(data: bytes, filename: str, content_type: str,
             return ExtractionResult(status=status, method="image_ocr", error=err)
 
         if ext == ".docx" or "wordprocessingml" in ctype:
-            return _cap(ExtractionResult(normalize_text(_docx(data)), "docx_xml", STATUS_OK), settings)
+            return _cap(ExtractionResult(normalize_text(_docx(data, settings)), "docx_xml", STATUS_OK), settings)
         if ext == ".xlsx" or "spreadsheetml" in ctype:
-            return _cap(ExtractionResult(normalize_text(_xlsx(data)), "xlsx_xml", STATUS_OK), settings)
+            return _cap(ExtractionResult(normalize_text(_xlsx(data, settings)), "xlsx_xml", STATUS_OK), settings)
         if ext == ".pptx" or "presentationml" in ctype:
-            return _cap(ExtractionResult(normalize_text(_pptx(data)), "pptx_xml", STATUS_OK), settings)
+            return _cap(ExtractionResult(normalize_text(_pptx(data, settings)), "pptx_xml", STATUS_OK), settings)
         if ext in (".odt", ".ods", ".odp") or ctype.startswith("application/vnd.oasis"):
-            return _cap(ExtractionResult(normalize_text(_odf(data)), "odf_xml", STATUS_OK), settings)
+            return _cap(ExtractionResult(normalize_text(_odf(data, settings)), "odf_xml", STATUS_OK), settings)
+
+        if _is_archive(ext.lstrip("."), ctype, data):
+            return _archive(data, filename, settings, depth, budget)
 
         if ext in _HTML_EXT or ctype in ("text/html", "application/xhtml+xml"):
             return _cap(ExtractionResult(html_to_text(decode_bytes(data)), "html", STATUS_OK), settings)

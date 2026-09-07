@@ -203,3 +203,130 @@ def test_nome_cartella_leggibile_e_stabile(writer, cfg, account):
     assert "rossi" in nome
     assert "avviso-di-accertamento" in nome
     assert not any(c in nome for c in '<>:"/\\|?*')
+
+
+# ---------------------------------------------------------------------------
+# Allegati ostili: cosa finisce davvero su disco
+# ---------------------------------------------------------------------------
+
+def test_eseguibile_censito_ma_mai_scritto(writer, cfg, account):
+    raw = f.busta_trasporto(postacert=f.inner_message(
+        attachments=[("Fattura_2026.pdf.exe", f.EXE_BYTES, "octet-stream")],
+    ))
+    pm, res = _scrivi(writer, account, raw)
+    base = cfg.output_root / res.content_dir
+
+    assert list((base / "allegati").iterdir()) == []
+    meta = json.loads((base / "messaggio.json").read_text(encoding="utf-8"))
+    allegato = meta["allegati"][0]
+    assert allegato["salvato"] is False
+    assert "tipo attivo" in allegato["motivo"]
+    assert allegato["contenuto_attivo"] is True
+    # censito per intero, e recuperabile dal sorgente originale conservato
+    assert allegato["nome"] == "Fattura_2026.pdf.exe"
+    assert allegato["byte"] == len(f.EXE_BYTES) and allegato["sha256"]
+    assert b"Fattura_2026.pdf.exe" in (base / "postacert.eml").read_bytes()
+    assert (base / "busta.eml").stat().st_size > 0
+
+
+def test_eseguibile_travestito_da_pdf_non_scritto(writer, cfg, account):
+    raw = f.busta_trasporto(postacert=f.inner_message(
+        attachments=[("Avviso.pdf", f.EXE_BYTES, "pdf")],
+    ))
+    pm, res = _scrivi(writer, account, raw)
+    base = cfg.output_root / res.content_dir
+    assert list((base / "allegati").iterdir()) == []
+    meta = json.loads((base / "messaggio.json").read_text(encoding="utf-8"))
+    assert meta["allegati"][0]["contenuto_sospetto"] is True
+    assert meta["allegati"][0]["salvato"] is False
+
+
+def test_office_con_macro_salvato_ma_segnalato(writer, cfg, account):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("word/document.xml",
+                    '<?xml version="1.0"?><w:document xmlns:w="x"><w:body>'
+                    "<w:p><w:r><w:t>Con macro</w:t></w:r></w:p>"
+                    "</w:body></w:document>")
+    raw = f.busta_trasporto(postacert=f.inner_message(
+        attachments=[("modulo.docm", buf.getvalue(), "octet-stream")],
+    ))
+    pm, res = _scrivi(writer, account, raw)
+    base = cfg.output_root / res.content_dir
+    assert (base / "allegati" / "modulo.docm").is_file()
+    meta = json.loads((base / "messaggio.json").read_text(encoding="utf-8"))
+    assert meta["allegati"][0]["contenuto_attivo"] is True
+    assert "Con macro" in (base / "allegati" / "modulo.docm.txt").read_text()
+
+
+def test_voci_di_archivio_con_nomi_generati(writer, cfg, account):
+    contenuto = f.zip_bytes([
+        ("fatture/Fattura 12.txt", "Imponibile 1.234,00 euro".encode()),
+        ("../../etc/passwd", b"root:x:0:0"),
+        ("Fattura_2026.pdf.exe", f.EXE_BYTES),
+    ])
+    raw = f.busta_con_archivio("Fatture.zip", contenuto)
+    pm, res = _scrivi(writer, account, raw)
+    base = cfg.output_root / res.content_dir
+    member_dir = base / "allegati" / "Fatture.zip.d"
+
+    scritti = sorted(p.name for p in member_dir.iterdir())
+    assert scritti == ["001_Fattura 12.txt", "001_Fattura 12.txt.txt"]
+    assert "1.234,00" in (member_dir / "001_Fattura 12.txt.txt").read_text()
+
+    # nulla fuori dalla cartella del messaggio
+    assert not (cfg.output_root / "etc").exists()
+    for percorso in base.rglob("*"):
+        assert base in percorso.parents or percorso.parent == base
+
+    meta = json.loads((base / "messaggio.json").read_text(encoding="utf-8"))
+    archivio = meta["allegati"][0]["archivio"]
+    assert archivio["formato"] == "zip" and archivio["voci"] == 3
+    per_nome = {m["nome"]: m for m in archivio["membri"]}
+    assert per_nome["Fattura 12.txt"]["percorso_dichiarato"] == "fatture/Fattura 12.txt"
+    assert per_nome["passwd"]["percorso_dichiarato"] == "../../etc/passwd"
+    assert per_nome["passwd"]["salvato"] is False
+    assert per_nome["Fattura_2026.pdf.exe"]["salvato"] is False
+
+
+def test_archivio_annidato_scrive_solo_le_foglie(writer, cfg, account):
+    interno = f.zip_bytes([("nota.txt", b"contenuto profondo")])
+    esterno = f.zip_bytes([("interno.zip", interno)])
+    raw = f.busta_con_archivio("pacco.zip", esterno)
+    pm, res = _scrivi(writer, account, raw)
+    member_dir = cfg.output_root / res.content_dir / "allegati" / "pacco.zip.d"
+    scritti = sorted(p.name for p in member_dir.iterdir())
+    assert scritti == ["001_nota.txt", "001_nota.txt.txt"]
+    assert "contenuto profondo" in (member_dir / "001_nota.txt.txt").read_text()
+
+    meta = json.loads((cfg.output_root / res.content_dir / "messaggio.json")
+                      .read_text(encoding="utf-8"))
+    membri = meta["allegati"][0]["archivio"]["membri"]
+    assert membri[0]["percorso_dichiarato"] == "interno.zip/nota.txt"
+
+
+def test_bomba_annotata_e_messaggio_comunque_scritto(cfg, account):
+    from pecfetch.extract import ExtractorSettings
+    from pecfetch.safety import ArchiveLimits
+
+    writer = OutputWriter(cfg.output_root,
+                          ExtractorSettings(ocr=False,
+                                            archive=ArchiveLimits(max_ratio=10)))
+    raw = f.busta_con_archivio("fatture.zip", f.zip_bomb(size=4 * 1024 * 1024))
+    pm, res = _scrivi(writer, account, raw)
+    base = cfg.output_root / res.content_dir
+    assert (base / "corpo.txt").is_file()
+    assert res.index_record["allegati"][0]["testo"] == "archive_limit"
+    meta = json.loads((base / "messaggio.json").read_text(encoding="utf-8"))
+    assert "rapporto" in meta["allegati"][0]["archivio"]["limite_superato"]
+
+
+def test_indice_riporta_il_conteggio_delle_voci(writer, cfg, account):
+    raw = f.busta_con_archivio()
+    pm, res = _scrivi(writer, account, raw)
+    allegato = res.index_record["allegati"][0]
+    assert allegato["voci"] == 2
+    assert allegato["nome"] == "Fatture.zip"

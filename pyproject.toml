@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pecfetch"
 version = "1.0.0"
-description = "Estrattore read-only di caselle PEC verso una cartella condivisa, per consumo da parte di un componente a valle"
+description = "Estrattore read-only di caselle PEC verso dati strutturati, per consumo da parte di un componente a valle"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

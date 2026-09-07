@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pecfetch",
         description="Estrae in sola lettura i messaggi dalle caselle PEC e li "
-                    "scrive come dati strutturati nella cartella condivisa.",
+                    "scrive come dati strutturati nella cartella di output.",
     )
     parser.add_argument("--version", action="version", version=f"pecfetch {__version__}")
     parser.add_argument("-c", "--config", metavar="FILE",
@@ -296,6 +296,22 @@ def cmd_check(cfg: Config, args) -> int:
         problems += 1
     else:
         print(f"output_root    : {cfg.output_root}  scrivibile")
+
+    print("\ntrattamento degli allegati:")
+    print(f"  tipi attivi        {'mai materializzati' if cfg.block_active_types else 'CONSENTITI'}"
+          + (f"  (+{len(cfg.active_types_extra)} estensioni aggiuntive)"
+             if cfg.active_types_extra else ""))
+    if not cfg.block_active_types:
+        print("  ATTENZIONE: eseguibili e script verranno scritti in output")
+        problems += 1
+    if cfg.archive_enabled:
+        print(f"  archivi            rapporto max {cfg.archive_max_ratio}:1, "
+              f"{cfg.archive_max_total_bytes // (1024 * 1024)} MiB espansi, "
+              f"{cfg.archive_max_entries} voci, {cfg.archive_max_depth} livelli, "
+              f"{cfg.archive_max_member_bytes // (1024 * 1024)} MiB per voce")
+    else:
+        print("  archivi            non aperti (estrazione disabilitata)")
+    print("  formati opachi     rar, 7z e immagini disco non vengono aperti")
 
     tools = available_tools()
     print("\nstrumenti di estrazione:")
