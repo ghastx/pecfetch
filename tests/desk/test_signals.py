@@ -232,3 +232,30 @@ def test_un_archivio_che_non_si_apre_basta_da_solo(queue_dir):
                                               method="archive")])
     signals = collect(item, CONOSCIUTO, "", declared_sender=True)
     assert signals.level == "possibile"
+
+
+def test_storico_trovato_anche_se_il_mittente_scriveva_in_maiuscolo(tmp_path, queue_dir):
+    """Mezza pubblica amministrazione scrive Mario.Rossi@PEC.IT.
+
+    Finché l'archivio conservava l'indirizzo verbatim e la coda lo leggeva
+    minuscolo, il confronto `from_addr = ?` non trovava mai niente: un mittente
+    con anni di corrispondenza risultava «mai visto» a ogni messaggio.
+    """
+    from pecfetch.archive import Archive
+
+    path = tmp_path / "archivio.sqlite3"
+    precedente = {
+        "id": "vecchio1", "casella": {"id": "rossi", "cliente": "ROSSI"},
+        "mittente": {"indirizzo": "Mario.Rossi@PEC.IT", "dominio": "PEC.IT"},
+        "data": {"certificata": "2026-01-07T08:30:00+01:00"},
+        "acquisito_il": "2026-01-07T08:30:00+01:00", "tipo": "posta_certificata",
+        "oggetto": "x", "destinatari": [], "allegati": [], "contenuto": {},
+    }
+    with Archive(path) as writable:
+        writable.add(precedente, "indice/2026-01-07.jsonl")
+
+    item = _item(queue_dir, msg_id="nuovo1", sender="MARIO.ROSSI@pec.it")
+    with ArchiveHistory(path, SuspicionLimits()) as history:
+        found = history.lookup(item)
+    assert found.seen_on_mailbox == 1
+    assert found.novel_on_mailbox is False

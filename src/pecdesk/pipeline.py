@@ -30,7 +30,7 @@ from .material import build as build_material
 from .model import (Classifier, ModelError, ModelRefused, ModelStop,
                     ModelUnavailable, PROMPT_VERSION, Request, build_request)
 from .outcomes import Outcome, OutcomeStore
-from .queue import QueueItem, move_to_worked, scan
+from .queue import QueueError, QueueItem, move_to_worked, scan
 from .rules import RuleMatch, apply_rules
 from .signals import ArchiveHistory, History, Signals, collect
 from .state import State
@@ -108,8 +108,8 @@ class Runner:
                 self.state.mark_archived(msg_id)   # già sparito dalla coda
                 continue
             try:
-                move_to_worked(item.path, self.cfg.worked_dir)
-            except OSError as exc:
+                self._sposta(item)
+            except (OSError, QueueError) as exc:
                 summary.problems.append(f"{msg_id}: spostamento fallito ({exc})")
                 continue
             self.state.mark_archived(msg_id)
@@ -151,11 +151,17 @@ class Runner:
         path = self.store.append(outcome)
         self.state.mark_classified(outcome.id, path.name, outcome.klass)
         try:
-            move_to_worked(item.path, self.cfg.worked_dir)
-        except OSError as exc:
+            self._sposta(item)
+        except (OSError, QueueError) as exc:
             log.warning("%s: spostamento rimandato (%s)", outcome.id, exc)
             return
         self.state.mark_archived(outcome.id)
+
+    def _sposta(self, item: QueueItem) -> None:
+        """Fuori dalla coda, sotto il giorno del fuso dichiarato."""
+        move_to_worked(item.path, self.cfg.worked_dir,
+                       when=self.store.now(),
+                       permissions=self.cfg.permissions)
 
     def run(self, limit: int | None = None) -> RunSummary:
         summary = RunSummary()
@@ -284,7 +290,8 @@ class Runner:
         html_body = render_html(digest)
         if cfg.copy_dir:
             try:
-                write_copy(cfg.copy_dir, day, text, html_body)
+                write_copy(cfg.copy_dir, day, text, html_body,
+                           self.cfg.permissions)
             except OSError as exc:
                 log.warning("copia del riepilogo non scritta: %s", exc)
 

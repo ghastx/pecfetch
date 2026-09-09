@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from pecfetch import permessi as perm, tempo
+
 SCHEMA_OUTCOME = "pecdesk/esito/1"
 SCHEMA_CORRECTION = "pecdesk/correzione/1"
 
@@ -153,16 +155,16 @@ class Outcome:
 class OutcomeStore:
     """Unico punto di scrittura in ``esiti/``. I file di input non si toccano."""
 
-    def __init__(self, root: Path, timezone: str = "Europe/Rome"):
-        from zoneinfo import ZoneInfo
-
+    def __init__(self, root: Path, timezone: str = tempo.DEFAULT_TZ,
+                 permissions: perm.Permessi | None = None):
         self.root = Path(root)
-        try:
-            self.tz = ZoneInfo(timezone)
-        except Exception:
-            self.tz = ZoneInfo("UTC")
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / DIR_CORRECTIONS).mkdir(parents=True, exist_ok=True)
+        # un fuso sbagliato è un errore di configurazione, non un ripiego su UTC
+        self.tz = tempo.zona(timezone)
+        self.permessi = permissions or perm.Permessi()
+        # esiti/ è condivisa: pecfetch la crea, pecdesk ci scrive
+        perm.crea_dir(self.root, self.permessi.shared_dir_mode, self.permessi)
+        perm.crea_dir(self.root / DIR_CORRECTIONS, self.permessi.shared_dir_mode,
+                      self.permessi)
 
     def now(self) -> datetime:
         return datetime.now(self.tz)
@@ -175,8 +177,7 @@ class OutcomeStore:
         when = when or self.now()
         return self.root / DIR_CORRECTIONS / f"{when:%Y-%m-%d}.jsonl"
 
-    @staticmethod
-    def _append(path: Path, record: dict) -> None:
+    def _append(self, path: Path, record: dict) -> None:
         """Append per riga, con `fsync`: una riga o c'è tutta o non c'è.
 
         Se l'ultima riga è rimasta a metà — un'interruzione fra la scrittura e
@@ -184,9 +185,9 @@ class OutcomeStore:
         mangerebbe anche quella nuova, e si perderebbe un esito già prodotto per
         colpa di uno già perso.
         """
-        path.parent.mkdir(parents=True, exist_ok=True)
+        perm.crea_dir(path.parent, self.permessi.shared_dir_mode, self.permessi)
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = perm.apri_append(path, self.permessi, rileggibile=True)
         try:
             size = os.fstat(fd).st_size
             if size and os.pread(fd, 1, size - 1) != b"\n":

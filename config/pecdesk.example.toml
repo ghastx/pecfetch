@@ -22,11 +22,23 @@ state_dir = "/var/lib/pecdesk"
 # Deve stare sullo stesso filesystem della coda: lo spostamento è un rename.
 worked_dir = ""
 
+# Deve essere lo stesso di pecfetch: le due metà scrivono nello stesso albero e
+# due convenzioni diverse renderebbero le date incomparabili. Governa gli esiti,
+# i nomi dei file, lo stato locale e i timestamp del log.
 timezone = "Europe/Rome"
 
 # Dopo N tentativi falliti un messaggio resta in coda ma non si ritenta più
 # da solo: `pecdesk stato` lo mostra, `pecdesk riprova <id>` lo sblocca.
 tentativi_massimi = 3
+
+
+[permissions]
+# Permessi di ciò che pecdesk scrive: esiti/, lavorati/ e lo stato locale.
+# Da tenere uguali a quelli di pecfetch (vedi config/pecfetch.example.toml).
+dir_mode = "0750"
+file_mode = "0640"
+shared_dir_mode = "2770"
+group = ""
 
 
 [direttive]

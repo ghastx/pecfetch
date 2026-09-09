@@ -21,8 +21,10 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+
+from . import permessi as perm, tempo
 
 SCHEMA_VERSION = 1
 
@@ -110,10 +112,6 @@ CREATE TABLE IF NOT EXISTS run_errors (
 """
 
 
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 @dataclass
 class Cursor:
     """Posizione di lettura su una casella."""
@@ -138,9 +136,12 @@ class Cursor:
 class State:
     """Wrapper SQLite. Un solo scrittore per volta (garantito dal lock di run)."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, timezone_name: str = tempo.DEFAULT_TZ,
+                 permissions: perm.Permessi | None = None):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.tz = tempo.zona(timezone_name)
+        self.permessi = permissions or perm.Permessi()
+        perm.crea_dir(self.path.parent, self.permessi.dir_mode, self.permessi)
         self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -152,6 +153,11 @@ class State:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
+        perm.applica_sqlite(self.path, self.permessi)
+
+    def ora(self) -> str:
+        """Adesso, nel fuso dichiarato: una sola convenzione in tutto il programma."""
+        return tempo.ora(self.tz)
 
     # -- gestione --------------------------------------------------------
     def close(self) -> None:
@@ -220,8 +226,8 @@ class State:
             cur.last_uid = 0
         cur.last_uid = max(cur.last_uid, uid)
         cur.initialized = True
-        if seen_at and (not cur.last_seen_at or seen_at > cur.last_seen_at):
-            cur.last_seen_at = seen_at
+        if seen_at:
+            cur.last_seen_at = tempo.piu_recente(cur.last_seen_at, seen_at)
         self.save_cursor(cur)
 
     def reset_uidvalidity(self, account: str, folder: str, uidvalidity: int) -> None:
@@ -236,7 +242,7 @@ class State:
         self.save_cursor(cur)
 
     def mark_run(self, account: str, folder: str, ok: bool, error: str | None) -> None:
-        now = utcnow()
+        now = self.ora()
         self.db.execute(
             """
             INSERT INTO mailboxes (account, folder, last_run_at, last_ok_at, last_error)
@@ -287,7 +293,7 @@ class State:
                 error=NULL
             """,
             (account, uidvalidity, uid, msg_id, content_hash, msg_type,
-             STATUS_PENDING, message_id, subject, 1, utcnow()),
+             STATUS_PENDING, message_id, subject, 1, self.ora()),
         )
         row = self.db.execute(
             "SELECT attempts FROM messages WHERE account=? AND uidvalidity=? AND uid=?",
@@ -319,7 +325,7 @@ class State:
         self.db.execute(
             "UPDATE messages SET status=?, error=?, done_at=? "
             "WHERE account=? AND uidvalidity=? AND uid=?",
-            (status, error, utcnow(), account, uidvalidity, uid),
+            (status, error, self.ora(), account, uidvalidity, uid),
         )
 
     def record_receipt(self, msg_id: str, account: str, kind: str,
@@ -333,7 +339,7 @@ class State:
             ON CONFLICT(msg_id) DO NOTHING
             """,
             (msg_id, account, kind, ref_message_id, subject, gestore,
-             date_certified, utcnow()),
+             date_certified, self.ora()),
         )
 
     def pending_messages(self, account: str | None = None) -> list[sqlite3.Row]:
@@ -347,7 +353,7 @@ class State:
     # -- diario ----------------------------------------------------------
     def start_run(self, mode: str) -> int:
         cur = self.db.execute(
-            "INSERT INTO runs (started_at, mode) VALUES (?,?)", (utcnow(), mode)
+            "INSERT INTO runs (started_at, mode) VALUES (?,?)", (self.ora(), mode)
         )
         return int(cur.lastrowid)
 
@@ -356,13 +362,13 @@ class State:
         self.db.execute(
             "UPDATE runs SET finished_at=?, accounts_ok=?, accounts_err=?, "
             "written=?, skipped=?, exit_code=? WHERE id=?",
-            (utcnow(), ok, err, written, skipped, exit_code, run_id),
+            (self.ora(), ok, err, written, skipped, exit_code, run_id),
         )
 
     def log_error(self, run_id: int, account: str | None, phase: str, message: str) -> None:
         self.db.execute(
             "INSERT INTO run_errors (run_id, account, phase, message, at) VALUES (?,?,?,?,?)",
-            (run_id, account, phase, message[:4000], utcnow()),
+            (run_id, account, phase, message[:4000], self.ora()),
         )
 
     def stats(self) -> dict:
@@ -409,7 +415,7 @@ def message_key(account: str, content_hash_hex: str) -> str:
 
 
 __all__ = [
-    "State", "Cursor", "content_hash", "message_key", "utcnow",
+    "State", "Cursor", "content_hash", "message_key",
     "STATUS_PENDING", "STATUS_DONE", "STATUS_SKIPPED", "STATUS_DUPLICATE",
     "STATUS_FAILED", "SCHEMA_VERSION",
 ]

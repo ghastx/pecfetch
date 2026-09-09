@@ -29,7 +29,6 @@ from .mimeutil import (
     decode_bytes,
     header,
     html_to_text,
-    iso,
     normalize_text,
     parse_addresses,
     parse_date,
@@ -206,9 +205,9 @@ def parse_daticert(raw: bytes) -> DatiCert | None:
 
     intest = root.find("intestazione")
     if intest is not None:
-        dc.mittente = _text(intest.find("mittente"))
+        dc.mittente = _indirizzo(_text(intest.find("mittente")))
         for dest in intest.findall("destinatari"):
-            addr = _text(dest)
+            addr = _indirizzo(_text(dest))
             if addr:
                 dc.destinatari.append(
                     {"address": addr, "tipo": (dest.get("tipo") or "").strip().lower()}
@@ -223,7 +222,7 @@ def parse_daticert(raw: bytes) -> DatiCert | None:
         ric = dati.find("ricevuta")
         if ric is not None:
             dc.ricevuta_tipo = (ric.get("tipo") or "").strip().lower()
-        dc.consegna = _text(dati.find("consegna"))
+        dc.consegna = _indirizzo(_text(dati.find("consegna")))
         dc.errore_esteso = _text(dati.find("errore-esteso"))
         dc.data = _parse_daticert_date(dati.find("data"))
     return dc
@@ -249,14 +248,14 @@ def _daticert_fallback(raw: bytes, dc: DatiCert) -> DatiCert | None:
         match = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", text, re.S)
         return normalize_text(match.group(1)) if match else ""
 
-    dc.mittente = grab("mittente")
+    dc.mittente = _indirizzo(grab("mittente"))
     dc.oggetto = grab("oggetto")
     dc.gestore = grab("gestore-emittente")
     dc.identificativo = grab("identificativo")
     dc.msgid = grab("msgid")
     dc.errore_esteso = grab("errore-esteso")
     for dest in re.finditer(r"<destinatari[^>]*>(.*?)</destinatari>", text, re.S):
-        addr = normalize_text(dest.group(1))
+        addr = _indirizzo(normalize_text(dest.group(1)))
         if addr:
             dc.destinatari.append({"address": addr, "tipo": ""})
     giorno, ora = grab("giorno"), grab("ora")
@@ -269,6 +268,15 @@ def _daticert_fallback(raw: bytes, dc: DatiCert) -> DatiCert | None:
         ElementTree.SubElement(fake, "ora").text = ora
         dc.data = _parse_daticert_date(fake)
     return dc if dc.tipo else None
+
+
+def _indirizzo(value: str) -> str:
+    """Un indirizzo scritto dal gestore, normalizzato come tutti gli altri.
+
+    Le maiuscole nella parte locale sono frequenti nelle PEC della pubblica
+    amministrazione; qui diventano irrilevanti una volta per tutte.
+    """
+    return (value or "").strip().lower()
 
 
 def _parse_daticert_date(node) -> datetime | None:
@@ -656,7 +664,7 @@ def parse_pec(raw: bytes, internaldate: datetime | None = None) -> ParsedMessage
             {
                 "name": "",
                 "address": d["address"],
-                "domain": d["address"].rsplit("@", 1)[-1].lower(),
+                "domain": d["address"].rsplit("@", 1)[-1],
                 "tipo": d.get("tipo", ""),
             }
             for d in dc.destinatari
@@ -699,5 +707,4 @@ __all__ = [
     "classify", "is_output_type", "receipt_class", "certified_or_best_date",
     "summary_line", "RECEIPTS_POSITIVE", "RECEIPTS_NEGATIVE", "ALL_RECEIPTS",
     "TYPE_POSTA_CERTIFICATA", "TYPE_BUSTA_ANOMALIA", "TYPE_GENERICO",
-    "iso",
 ]

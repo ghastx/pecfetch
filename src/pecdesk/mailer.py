@@ -17,6 +17,8 @@ from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from pathlib import Path
 
+from pecfetch import permessi as perm
+
 from .config import DigestSettings
 
 log = logging.getLogger("pecdesk.mailer")
@@ -50,19 +52,28 @@ def build_message(settings: DigestSettings, subject: str, text: str,
     return message
 
 
-def write_copy(directory: Path, day: str, text: str, html_body: str) -> Path:
-    """Copia su file. Utile per diagnosi, e per chi il riepilogo lo vuole lì."""
+def write_copy(directory: Path, day: str, text: str, html_body: str,
+               permissions: perm.Permessi | None = None) -> Path:
+    """Copia su file. Utile per diagnosi, e per chi il riepilogo lo vuole lì.
+
+    Il riepilogo contiene oggetti e mittenti di PEC: vale il modello di permessi
+    del resto dell'albero, non quello che capita dalla umask.
+    """
+    permissions = permissions or perm.Permessi()
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    perm.crea_dir(directory, permissions.dir_mode, permissions)
     txt = directory / f"{day}.txt"
     txt.write_text(text, encoding="utf-8")
+    perm.applica_file(txt, permissions)
     if html_body:
-        (directory / f"{day}.html").write_text(
+        html = directory / f"{day}.html"
+        html.write_text(
             f"<!doctype html><html><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"</head><body>{html_body}</body></html>",
             encoding="utf-8",
         )
+        perm.applica_file(html, permissions)
     return txt
 
 

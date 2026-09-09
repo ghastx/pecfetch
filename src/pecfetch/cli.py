@@ -13,11 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from datetime import date
 from pathlib import Path
 
-from . import __version__
+from . import __version__, permessi as perm, spazio
 from .archive import Archive
 from .config import Config, ConfigError, load_config, redacted
 from .extract import ExtractorSettings, available_tools
@@ -29,6 +30,7 @@ from .pipeline import (
     MODE_BACKFILL,
     MODE_INIT,
     MODE_RUN,
+    PROVA,
     Pipeline,
     RunSummary,
     default_connect,
@@ -134,7 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_parse.add_argument("file", type=Path)
     p_parse.add_argument("--json", action="store_true")
 
-    sub.add_parser("cleanup", help="rimuove i montaggi rimasti da run interrotti")
+    p_clean = sub.add_parser(
+        "cleanup", help="rimuove i montaggi rimasti da run interrotti")
+    p_clean.add_argument("--permessi", action="store_true",
+                         help="riapplica il modello di permessi all'albero prodotto")
     return parser
 
 
@@ -154,15 +159,17 @@ def _select_accounts(cfg: Config, wanted: list[str]):
     return out
 
 
-def _open_stack(cfg: Config):
-    state = State(cfg.state_dir / "stato.sqlite3")
-    archive = Archive(cfg.archive_path)
+def _open_stack(cfg: Config, layout: bool = True):
+    state = State(cfg.state_dir / "stato.sqlite3", cfg.timezone, cfg.permissions)
+    archive = Archive(cfg.archive_path, permissions=cfg.permissions)
     writer = OutputWriter(
         cfg.output_root,
         ExtractorSettings.from_config(cfg),
         body_max_chars=cfg.body_max_chars,
         attachment_store_max_bytes=cfg.attachment_store_max_bytes,
         timezone=cfg.timezone,
+        permissions=cfg.permissions,
+        layout=layout,
     )
     return state, archive, writer
 
@@ -176,21 +183,27 @@ def cmd_fetch(cfg: Config, args, mode: str) -> int:
         except ValueError:
             raise ConfigError(f"data non valida: {args.since!r} (attesa AAAA-MM-GG)")
 
-    lock = RunLock(cfg.state_dir / "pecfetch.lock")
+    lock = RunLock(cfg.state_dir / "pecfetch.lock", cfg.permissions)
     try:
         lock.acquire()
     except AlreadyRunning as exc:
         log.warning("%s: non faccio nulla", exc)
         return EXIT_LOCKED
 
+    dry_run = bool(getattr(args, "dry_run", False))
     state = archive = None
     try:
-        state, archive, writer = _open_stack(cfg)
-        removed = writer.cleanup_staging()
-        if removed:
-            log.info("rimossi %d montaggi incompleti di esecuzioni precedenti", removed)
+        # In prova a vuoto l'albero di output non si crea e i montaggi
+        # incompleti non si cancellano: sono scritture, e una prova a vuoto non
+        # ne fa nessuna. Lo stato locale si apre lo stesso, in sola lettura di
+        # fatto: serve a sapere da dove si ripartirebbe.
+        state, archive, writer = _open_stack(cfg, layout=not dry_run)
+        if not dry_run:
+            removed = writer.cleanup_staging()
+            if removed:
+                log.info("rimossi %d montaggi incompleti di esecuzioni precedenti",
+                         removed)
 
-        dry_run = bool(getattr(args, "dry_run", False))
         run_id = None if dry_run else state.start_run(mode)
         pipeline = Pipeline(cfg, state, writer, archive, default_connect, run_id)
         summary = pipeline.run(
@@ -216,12 +229,14 @@ def cmd_fetch(cfg: Config, args, mode: str) -> int:
 
 
 def _print_summary(summary: RunSummary, dry_run: bool) -> None:
-    prefix = "PROVA - " if dry_run else ""
+    prefix = PROVA if dry_run else ""
     log.info(
-        "%sriepilogo %s: %d caselle ok, %d in errore, %d messaggi scritti, "
+        "%sriepilogo %s: %d caselle ok, %d in errore, %d messaggi %s, "
         "%d ricevute positive registrate, %d duplicati scartati, %d rimasti in coda",
         prefix, summary.mode, summary.accounts_ok, summary.accounts_err,
-        summary.written, summary.receipts, summary.duplicates, summary.remaining,
+        summary.candidates if dry_run else summary.written,
+        "da scaricare" if dry_run else "scritti",
+        summary.receipts, summary.duplicates, summary.remaining,
     )
     for account_id, error in summary.errors:
         log.error("%scasella in errore: %s -> %s", prefix, account_id, error)
@@ -231,7 +246,9 @@ def _print_summary(summary: RunSummary, dry_run: bool) -> None:
 
 
 def cmd_status(cfg: Config, args) -> int:
-    with State(cfg.state_dir / "stato.sqlite3") as state, Archive(cfg.archive_path) as archive:
+    with State(cfg.state_dir / "stato.sqlite3", cfg.timezone,
+               cfg.permissions) as state, \
+            Archive(cfg.archive_path, permissions=cfg.permissions) as archive:
         payload = {
             "configurazione": redacted(cfg),
             "stato": state.stats(),
@@ -278,14 +295,14 @@ def cmd_status(cfg: Config, args) -> int:
 
 
 def cmd_check(cfg: Config, args) -> int:
-    import os
-
     problems = 0
     print(f"configurazione : {cfg.source_path}")
     print(f"state_dir      : {cfg.state_dir}")
     print(f"archivio       : {cfg.archive_path}")
     print(f"caselle        : {len(cfg.accounts)} "
           f"({sum(1 for a in cfg.accounts if a.enabled)} attive)")
+    print(f"fuso orario    : {cfg.timezone}  (tutte le date esposte, non solo i nomi)")
+    print(f"permessi       : {perm.descrizione(cfg.permissions)}")
 
     # `check` non deve avere effetti collaterali: qui si guarda e basta.
     if not cfg.output_root.is_dir():
@@ -296,6 +313,32 @@ def cmd_check(cfg: Config, args) -> int:
         problems += 1
     else:
         print(f"output_root    : {cfg.output_root}  scrivibile")
+
+    # Spazio: i limiti sugli allegati proteggono dal singolo file patologico,
+    # non dall'accumulo di una coda che nessuno svuota.
+    ok_spazio, motivo = spazio.sufficiente(
+        (cfg.output_root, cfg.state_dir), cfg.min_free_bytes)
+    liberi = spazio.leggibile(spazio.liberi(cfg.output_root))
+    soglia = spazio.leggibile(cfg.min_free_bytes)
+    if ok_spazio:
+        print(f"spazio libero  : {liberi} (soglia {soglia})")
+    else:
+        print(f"spazio libero  : SOTTO SOGLIA - {motivo}")
+        problems += 1
+
+    # I permessi dell'albero già prodotto: divergono se è stato scritto da una
+    # versione precedente, o se qualcuno ci ha messo le mani.
+    if cfg.output_root.is_dir():
+        writer = OutputWriter(cfg.output_root, ExtractorSettings.from_config(cfg),
+                              timezone=cfg.timezone, permissions=cfg.permissions,
+                              layout=False)
+        fuori = writer.divergenze()
+        if fuori:
+            print(f"permessi albero: {len(fuori)} percorsi fuori modello "
+                  f"(sistemabili con 'pecfetch cleanup --permessi')")
+            for riga in fuori[:5]:
+                print(f"  {riga}")
+            problems += 1
 
     print("\ntrattamento degli allegati:")
     print(f"  tipi attivi        {'mai materializzati' if cfg.block_active_types else 'CONSENTITI'}"
@@ -320,7 +363,8 @@ def cmd_check(cfg: Config, args) -> int:
         print(f"  {name:<12} {state_txt}")
     langs = tools.get("tesseract_langs") or []
     if tools.get("tesseract"):
-        print(f"  lingue OCR   {', '.join(langs) if langs else '?'}"
+        elenco = ", ".join(langs) if langs else "?"
+        print(f"  lingue OCR   ({len(langs)}) {elenco}"
               + ("" if cfg.ocr_lang in langs else f"   <-- '{cfg.ocr_lang}' NON installata"))
         if cfg.ocr_lang not in langs:
             problems += 1
@@ -360,7 +404,7 @@ def cmd_check(cfg: Config, args) -> int:
 
 
 def cmd_search(cfg: Config, args) -> int:
-    with Archive(cfg.archive_path) as archive:
+    with Archive(cfg.archive_path, permissions=cfg.permissions) as archive:
         hits = archive.search(
             query=" ".join(args.query),
             client=args.client or "",
@@ -387,7 +431,8 @@ def cmd_search(cfg: Config, args) -> int:
 
 
 def cmd_receipts(cfg: Config, args) -> int:
-    with State(cfg.state_dir / "stato.sqlite3") as state:
+    with State(cfg.state_dir / "stato.sqlite3", cfg.timezone,
+               cfg.permissions) as state:
         sql = "SELECT * FROM receipts"
         params: list = []
         if args.account:
@@ -455,7 +500,19 @@ def cmd_parse(cfg: Config | None, args) -> int:
 
 def cmd_cleanup(cfg: Config, args) -> int:
     writer = OutputWriter(cfg.output_root, ExtractorSettings.from_config(cfg),
-                          timezone=cfg.timezone)
+                          timezone=cfg.timezone, permissions=cfg.permissions)
+    if getattr(args, "permessi", False):
+        # Le cartelle scritte prima che il modello fosse dichiarato hanno i
+        # permessi che capitavano: qui si riportano tutte a quello scelto.
+        fuori = writer.applica_permessi()
+        print(f"permessi riapplicati a {cfg.output_root}: "
+              f"{perm.descrizione(cfg.permissions)}")
+        if fuori:
+            print(f"ATTENZIONE: {len(fuori)} percorsi restano fuori modello")
+            for riga in fuori[:5]:
+                print(f"  {riga}")
+            return EXIT_PARTIAL
+        return EXIT_OK
     removed = writer.cleanup_staging(max_age_seconds=3600)
     print(f"{removed} montaggi incompleti rimossi")
     return EXIT_OK
@@ -488,7 +545,11 @@ def main(argv: list[str] | None = None) -> int:
         log.error("configurazione: %s", exc)
         return EXIT_FATAL
 
-    setup_logging(cfg.log_level, cfg.log_file, args.quiet, args.verbose)
+    # Rete di sicurezza per ciò che dovesse sfuggire ai chmod espliciti: da qui
+    # in poi la umask non può concedere più di quanto il modello preveda.
+    os.umask(perm.umask_da(cfg.permissions))
+    setup_logging(cfg.log_level, cfg.log_file, args.quiet, args.verbose,
+                  timezone_name=cfg.timezone)
     for message in warnings:
         log.warning("configurazione: %s", message)
 

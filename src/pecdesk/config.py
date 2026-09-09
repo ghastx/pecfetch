@@ -14,6 +14,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pecfetch import permessi as perm, tempo
+
 
 class ConfigError(Exception):
     """Configurazione assente, malformata o incoerente."""
@@ -117,11 +119,19 @@ class Config:
 
     log_file: Path | None = None
     log_level: str = "INFO"
-    timezone: str = "Europe/Rome"
+    #: lo stesso fuso di pecfetch: le due metà scrivono nello stesso albero
+    timezone: str = tempo.DEFAULT_TZ
+    #: lo stesso modello di permessi di pecfetch, per gli esiti e i lavorati
+    permissions: perm.Permessi = perm.Permessi()
     #: dopo N tentativi falliti un messaggio resta in coda ma non si ritenta
     max_attempts: int = 3
 
     source_path: Path | None = None
+
+    @property
+    def tz(self):
+        """Il fuso già risolto. Validato al caricamento, qui non può fallire."""
+        return tempo.zona(self.timezone)
 
     @property
     def outcomes_dir(self) -> Path:
@@ -295,6 +305,26 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
     logs = data.get("logging", {})
     log_file = as_path(logs["file"]) if logs.get("file") else None
 
+    # Stesso fuso e stessi permessi di pecfetch: le due metà scrivono nello
+    # stesso albero, e due convenzioni diverse lo renderebbero illeggibile.
+    timezone_name = str(general.get("timezone", tempo.DEFAULT_TZ))
+    try:
+        tempo.zona(timezone_name)
+    except ValueError as exc:
+        raise ConfigError(f"[general].timezone: {exc}") from exc
+
+    perms_raw = data.get("permissions", {})
+    try:
+        permissions = perm.Permessi(
+            dir_mode=perm.modo(perms_raw.get("dir_mode"), perm.DIR_MODE),
+            file_mode=perm.modo(perms_raw.get("file_mode"), perm.FILE_MODE),
+            shared_dir_mode=perm.modo(perms_raw.get("shared_dir_mode"),
+                                      perm.SHARED_DIR_MODE),
+            group=str(perms_raw.get("group", "")).strip(),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"[permissions]: {exc}") from exc
+
     return Config(
         output_root=output_root,
         archive_path=archive_path,
@@ -312,7 +342,8 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
         digest=digest,
         log_file=log_file,
         log_level=str(logs.get("level", "INFO")).upper(),
-        timezone=str(general.get("timezone", "Europe/Rome")),
+        timezone=timezone_name,
+        permissions=permissions,
         max_attempts=int(general.get("tentativi_massimi", 3)),
         source_path=config_path,
     )
@@ -333,6 +364,8 @@ def redacted(cfg: Config) -> dict:
         "modello": {"id": cfg.model, "max_tokens": cfg.max_tokens,
                     "api_key": f"<{cfg.api_key_source}>",
                     "ritentativi": cfg.api.max_retries},
+        "fuso": cfg.timezone,
+        "permessi": perm.descrizione(cfg.permissions),
         "riepilogo": {"destinatario": cfg.digest.to or "<non impostato>",
                       "smtp": f"{cfg.digest.smtp_host}:{cfg.digest.smtp_port}"
                               if cfg.digest.smtp_host else "<non impostato>",

@@ -250,3 +250,36 @@ def test_blocco_disattivabile():
     settings = ExtractorSettings(ocr=False, block_active_types=False)
     res = extract_text(b"#!/bin/sh\necho ciao", "script.sh", "", settings)
     assert res.status != STATUS_BLOCKED
+
+
+def test_lingue_ocr_senza_l_intestazione(monkeypatch):
+    """`--list-langs` stampa prima una riga di intestazione, e non è una lingua."""
+    from pecfetch import extract
+
+    uscita = b"List of available languages (3):\nosd\nita\neng\n"
+    monkeypatch.setattr(extract, "_have", lambda tool: tool == "tesseract")
+    monkeypatch.setattr(extract, "_optional_import", lambda mod: None)
+    monkeypatch.setattr(extract, "_run", lambda cmd, timeout: (0, uscita, b""))
+    assert extract.available_tools()["tesseract_langs"] == ["eng", "ita", "osd"]
+
+
+def test_lingue_ocr_forme_particolari():
+    from pecfetch.extract import _parse_langs
+
+    testa = 'List of available languages in "/usr/share/tessdata/" (4):'
+    assert _parse_langs(f"{testa}\nchi_sim\nscript/Latin\nita\nosd\n") == [
+        "chi_sim", "ita", "osd", "script/Latin"]
+    # senza intestazione (tesseract 3) non si perde la prima lingua
+    assert _parse_langs("eng\nita\n") == ["eng", "ita"]
+    assert _parse_langs("") == []
+
+
+def test_lingue_ocr_comando_fallito(monkeypatch):
+    """Con un codice di uscita diverso da zero non si stampa quello che capita."""
+    from pecfetch import extract
+
+    monkeypatch.setattr(extract, "_have", lambda tool: tool == "tesseract")
+    monkeypatch.setattr(extract, "_optional_import", lambda mod: None)
+    monkeypatch.setattr(extract, "_run",
+                        lambda cmd, timeout: (1, b"Error opening data file\n", b""))
+    assert extract.available_tools()["tesseract_langs"] == []

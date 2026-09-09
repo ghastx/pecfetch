@@ -29,16 +29,18 @@ import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-from . import __version__
+from . import __version__, permessi as perm, tempo
 from .extract import ExtractorSettings, extract_text
 from .naming import safe_filename, slugify, unique_filename
 from .safety import classify_file
 from .pec import ParsedMessage, certified_or_best_date, receipt_class
 
-SCHEMA_INDEX = "pecfetch/indice/1"
-SCHEMA_MESSAGE = "pecfetch/messaggio/1"
+#: versione 2: date rese tutte nel fuso dichiarato e indirizzi normalizzati.
+#: La forma dei record non cambia, il significato dei campi sì, e chi legge
+#: deve poterlo distinguere senza confrontare i valori.
+SCHEMA_INDEX = "pecfetch/indice/2"
+SCHEMA_MESSAGE = "pecfetch/messaggio/2"
 
 DIR_QUEUE = "coda"
 DIR_INDEX = "indice"
@@ -67,30 +69,100 @@ class WriteResult:
 class OutputWriter:
     """Unico punto di scrittura sulla cartella di output."""
 
+    #: le cartelle che il consumatore deve poter scrivere: ci sposta dentro o
+    #: fuori intere cartelle, e per farlo serve il permesso sulla directory
+    CONDIVISE = (DIR_QUEUE, DIR_OUTCOMES)
+
     def __init__(self, root: Path, settings: ExtractorSettings,
                  body_max_chars: int = 200_000,
                  attachment_store_max_bytes: int = 50 * 1024 * 1024,
-                 timezone: str = "Europe/Rome"):
+                 timezone: str = tempo.DEFAULT_TZ,
+                 permissions: perm.Permessi | None = None,
+                 layout: bool = True):
         self.root = Path(root)
         self.settings = settings
         self.body_max_chars = body_max_chars
         self.attachment_store_max_bytes = attachment_store_max_bytes
-        try:
-            self.tz = ZoneInfo(timezone)
-        except Exception:
-            self.tz = ZoneInfo("UTC")
-        self.ensure_layout()
+        # un fuso sbagliato è un errore di configurazione, non un ripiego su UTC
+        self.tz = tempo.zona(timezone)
+        self.permessi = permissions or perm.Permessi()
+        # in prova a vuoto non si crea nemmeno l'albero: "non scrive nulla"
+        # deve valere per l'albero prodotto, non solo per il riepilogo
+        if layout:
+            self.ensure_layout()
 
     # -- struttura -------------------------------------------------------
     def ensure_layout(self) -> None:
         for name in (DIR_QUEUE, DIR_INDEX, DIR_OUTCOMES, DIR_STAGING):
-            (self.root / name).mkdir(parents=True, exist_ok=True)
+            modo = (self.permessi.shared_dir_mode if name in self.CONDIVISE
+                    else self.permessi.dir_mode)
+            perm.crea_dir(self.root / name, modo, self.permessi)
         contract = self.root / "CONTRATTO.md"
-        if not contract.exists():
-            contract.write_text(_CONTRACT_TEXT, encoding="utf-8")
+        testo = self._contratto()
+        # il contratto dichiara fuso e permessi effettivi: se cambiano in
+        # configurazione, il file in radice deve dirlo, non restare al vecchio
+        if not contract.exists() or contract.read_text(encoding="utf-8") != testo:
+            contract.write_text(testo, encoding="utf-8")
+        perm.applica_file(contract, self.permessi)
         readme = self.root / DIR_OUTCOMES / "LEGGIMI.md"
         if not readme.exists():
             readme.write_text(_OUTCOMES_README, encoding="utf-8")
+        perm.applica_file(readme, self.permessi)
+
+    def applica_permessi(self) -> list[str]:
+        """Riporta l'albero già prodotto al modello dichiarato.
+
+        Serve a chi aggiorna: le cartelle scritte prima di questa versione hanno
+        i permessi che capitavano, e non si sistemano a mano una per una.
+        """
+        self.ensure_layout()
+        for name in (DIR_QUEUE, DIR_INDEX):
+            radice = self.root / name
+            if radice.is_dir():
+                modo = (self.permessi.shared_dir_mode if name in self.CONDIVISE
+                        else self.permessi.dir_mode)
+                perm.applica_albero(radice, self.permessi, root_mode=modo)
+        # di esiti/ si sistema la cartella, non quello che c'è dentro: quei file
+        # li ha scritti il consumatore e non sono nostri da toccare
+        perm.crea_dir(self.root / DIR_OUTCOMES, self.permessi.shared_dir_mode,
+                      self.permessi)
+        perm.applica_file(self.root / "CONTRATTO.md", self.permessi)
+        return self.divergenze()
+
+    def divergenze(self) -> list[str]:
+        """I percorsi che non corrispondono al modello. Non corregge niente."""
+        fuori: list[str] = []
+        for name in (DIR_QUEUE, DIR_INDEX):
+            radice = self.root / name
+            if not radice.is_dir():
+                continue
+            atteso = (self.permessi.shared_dir_mode if name in self.CONDIVISE
+                      else self.permessi.dir_mode)
+            attuale = radice.stat().st_mode & 0o7777
+            if attuale != atteso:
+                fuori.append(f"{radice}: {attuale:04o} invece di {atteso:04o}")
+            fuori += perm.divergenze(radice, self.permessi)
+        esiti = self.root / DIR_OUTCOMES
+        if esiti.is_dir():
+            attuale = esiti.stat().st_mode & 0o7777
+            if attuale != self.permessi.shared_dir_mode:
+                fuori.append(f"{esiti}: {attuale:04o} invece di "
+                             f"{self.permessi.shared_dir_mode:04o}")
+        return fuori[:20]
+
+    def _contratto(self) -> str:
+        esempio = tempo.reso(datetime(2026, 9, 5, 10, 31, 0, tzinfo=self.tz), self.tz)
+        p = self.permessi
+        return _CONTRACT_TEXT.format(
+            fuso=self.tz.key,
+            esempio=esempio,
+            permessi=(
+                f"    cartelle              {p.dir_mode & 0o7777:04o}\n"
+                f"    file                  {p.file_mode:04o}\n"
+                f"    coda/ ed esiti/       {p.shared_dir_mode:04o}"
+                + (f"\n    gruppo                {p.group}" if p.group else "")
+            ),
+        )
 
     def index_path(self, when: datetime | None = None) -> Path:
         when = when or datetime.now(self.tz)
@@ -114,6 +186,7 @@ class OutputWriter:
                 staging, pm, raw, account, msg_id, uidvalidity, uid, fetched_at,
                 dir_name, extraction,
             )
+            perm.applica_albero(staging, self.permessi)
             _fsync_tree(staging)
             already = False
             try:
@@ -145,7 +218,7 @@ class OutputWriter:
         path = self.index_path(when)
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         data = line.encode("utf-8")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        fd = perm.apri_append(path, self.permessi)
         try:
             os.write(fd, data)
             os.fsync(fd)
@@ -351,10 +424,12 @@ class OutputWriter:
             },
             "tipo": pm.msg_type,
             "certificato": pm.certified,
+            # tutte e tre nello stesso fuso: chi legge confronta orari
+            # confrontabili, senza conversioni a mente
             "data": {
-                "certificata": _iso(pm.date_certified),
-                "invio": _iso(pm.date_sent),
-                "ricezione": _iso(pm.date_received),
+                "certificata": tempo.reso(pm.date_certified, self.tz),
+                "invio": tempo.reso(pm.date_sent, self.tz),
+                "ricezione": tempo.reso(pm.date_received, self.tz),
             },
             "mittente": {
                 "indirizzo": pm.from_addr.get("address", ""),
@@ -433,7 +508,7 @@ class OutputWriter:
                 "destinatari": dc.destinatari,
                 "oggetto": dc.oggetto,
                 "gestore": dc.gestore,
-                "data": _iso(dc.data),
+                "data": tempo.reso(dc.data, self.tz),
                 "identificativo": dc.identificativo,
                 "msgid": dc.msgid,
                 "ricevuta_tipo": dc.ricevuta_tipo,
@@ -455,15 +530,6 @@ def _leaf_members(members, prefix: str = ""):
             yield from _leaf_members(nested, f"{declared}/")
         else:
             yield declared, member
-
-
-def _iso(value) -> str | None:
-    if value is None:
-        return None
-    try:
-        return value.isoformat()
-    except Exception:
-        return None
 
 
 def _fsync_tree(path: Path) -> None:
@@ -492,6 +558,44 @@ _CONTRACT_TEXT = """# Contratto di output di pecfetch
 
 Cartella prodotta da `pecfetch`. Sola lettura per chiunque non sia pecfetch,
 tranne `esiti/` che è del consumatore.
+
+## Date e fuso orario
+
+**Tutte** le date esposte — nell'indice, nei metadati, ovunque — sono ISO 8601
+con l'offset di **{fuso}**, con precisione al secondo:
+
+    {esempio}
+
+Non c'è nessun campo in UTC e nessun campo senza offset: due date di questo
+albero si confrontano fra loro senza conversioni. Vale per `data.certificata`,
+`data.invio`, `data.ricezione`, `acquisito_il` e `daticert.data`. I nomi dei
+file d'indice e delle cartelle usano lo stesso fuso, quindi il giorno del nome
+è il giorno della data.
+
+L'offset dichiarato dal gestore resta leggibile dentro `daticert.xml` e
+`busta.eml`, che non vengono mai riscritti: qui cambia come la data è resa, non
+quale istante indica.
+
+## Indirizzi
+
+Gli indirizzi esposti (`mittente.indirizzo`, `destinatari`, `copia`,
+`casella.indirizzo`, `daticert.mittente`, `daticert.destinatari`) sono sempre in
+minuscolo, parte locale compresa: nessun gestore PEC italiano tratta le caselle
+come sensibili alle maiuscole, e chi confronta questi campi non deve
+preoccuparsene. La forma scritta dal mittente non si perde: resta negli header
+conservati in `messaggio.json` (`header.From` e `header.To` per la busta,
+`header.postacert.From` e `header.postacert.To` per il messaggio interno) e
+integra dentro `busta.eml`.
+
+## Permessi
+
+{permessi}
+
+`coda/` ed `esiti/` sono scrivibili dal gruppo perché il consumatore, che gira
+con un'altra identità, deve poter spostare fuori dalla coda le cartelle che ha
+lavorato e scrivere i propri esiti. Il bit setgid tiene nel gruppo giusto ciò
+che il consumatore crea. Chi espone questa radice in sola lettura sulla rete lo
+fa con un servizio che appartiene al gruppo.
 
 ## Struttura
 
@@ -530,6 +634,9 @@ tranne `esiti/` che è del consumatore.
 * Il testo degli allegati riporta metodo ed esito dell'estrazione
   (`allegati[].metodo`, `allegati[].testo`): `pdf_ocr` significa OCR, quindi
   testo potenzialmente incerto.
+* Se lo spazio libero scende sotto la soglia configurata, pecfetch smette di
+  scrivere **prima** di cominciare un messaggio e lo annota nel proprio stato:
+  in questo albero non compaiono mai messaggi troncati per disco pieno.
 
 ## Allegati che non sono stati scritti
 

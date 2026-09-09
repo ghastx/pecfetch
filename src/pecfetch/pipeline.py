@@ -20,8 +20,9 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 
+from . import spazio, tempo
 from .archive import Archive
 from .config import Account, Config
 from .imapclient import ImapError, ImapReader
@@ -40,7 +41,6 @@ from .state import (
     State,
     content_hash,
     message_key,
-    utcnow,
 )
 
 log = logging.getLogger("pecfetch.pipeline")
@@ -53,12 +53,18 @@ MODE_BACKFILL = "backfill"
 #: rinunciando all'estrazione del testo, per non bloccare la casella.
 MAX_ATTEMPTS_BEFORE_DEGRADED = 3
 
+#: marca ogni riga prodotta da una prova a vuoto, non solo il riepilogo finale
+PROVA = "PROVA - "
+
 
 @dataclass
 class AccountResult:
     account_id: str
     ok: bool = True
+    #: messaggi davvero scritti in coda. In prova a vuoto resta a zero.
     written: int = 0
+    #: messaggi che si scaricherebbero: si riempie solo in prova a vuoto
+    candidates: int = 0
     receipts: int = 0
     duplicates: int = 0
     skipped: int = 0
@@ -72,7 +78,7 @@ class AccountResult:
 @dataclass
 class RunSummary:
     mode: str
-    started_at: str = field(default_factory=utcnow)
+    started_at: str = ""
     results: list[AccountResult] = field(default_factory=list)
 
     @property
@@ -86,6 +92,10 @@ class RunSummary:
     @property
     def written(self) -> int:
         return sum(r.written for r in self.results)
+
+    @property
+    def candidates(self) -> int:
+        return sum(r.candidates for r in self.results)
 
     @property
     def receipts(self) -> int:
@@ -125,17 +135,52 @@ class Pipeline:
         self.archive = archive
         self.connect = connect
         self.run_id = run_id
+        self.tz = tempo.zona(cfg.timezone)
+
+    # -- spazio ----------------------------------------------------------
+    def _spazio(self, margine: int = 0) -> tuple[bool, str]:
+        """C'è ancora posto per scrivere? Si guarda prima, non dopo.
+
+        Si controllano entrambi i filesystem coinvolti: un disco pieno non
+        blocca solo la coda, blocca anche lo stato, che è la parte che non può
+        fallire perché è l'unica verità su cosa è già stato scaricato.
+        """
+        return spazio.sufficiente(
+            (self.cfg.output_root, self.cfg.state_dir),
+            self.cfg.min_free_bytes, margine,
+        )
+
+    def _oggi(self) -> date:
+        """Il giorno nel fuso dichiarato: lo stesso che nomina indice e cartelle."""
+        return tempo.oggi(self.tz)
 
     # -- esecuzione ------------------------------------------------------
     def run(self, mode: str = MODE_RUN, accounts: list[Account] | None = None,
             since: date | None = None, lookback_days: int | None = None,
             limit: int | None = None, dry_run: bool = False) -> RunSummary:
-        summary = RunSummary(mode=mode)
+        summary = RunSummary(mode=mode, started_at=self.state.ora())
         accounts = accounts if accounts is not None else list(self.cfg.accounts)
         todo = [a for a in accounts if a.enabled]
         skipped_accounts = [a.id for a in accounts if not a.enabled]
         if skipped_accounts:
             log.info("caselle disabilitate, saltate: %s", ", ".join(skipped_accounts))
+
+        ok_spazio, motivo = self._spazio()
+        if not ok_spazio and dry_run:
+            # una prova a vuoto non si ferma, ma deve dirlo
+            log.warning("%sspazio insufficiente: un'esecuzione vera si fermerebbe "
+                        "senza scaricare niente (%s)", PROVA, motivo)
+        elif not ok_spazio:
+            # Meglio non cominciare che cominciare e lasciare a metà: un disco
+            # pieno fa fallire anche le scritture di stato.
+            log.error("spazio insufficiente, nessun messaggio scaricato: %s", motivo)
+            for account in todo:
+                risultato = AccountResult(account_id=account.id, ok=False,
+                                          error=f"spazio insufficiente: {motivo}")
+                summary.results.append(risultato)
+                if self.run_id is not None:
+                    self.state.log_error(self.run_id, account.id, "spazio", motivo)
+            return summary
 
         for account in todo:
             started = time.monotonic()
@@ -159,10 +204,16 @@ class Pipeline:
                 if not result.ok and self.run_id is not None:
                     self.state.log_error(self.run_id, account.id, mode, result.error)
             summary.results.append(result)
+            # In prova a vuoto non si è scritto niente: il verbo cambia, perché
+            # chi rilegge questo log fra sei mesi non deve concludere di avere
+            # in archivio messaggi che non esistono.
             log.info(
-                "[%s] %s: %d scritti, %d ricevute positive, %d duplicati, "
+                "%s[%s] %s: %d %s, %d ricevute positive, %d duplicati, "
                 "%d esaminati, %d rimasti (%.1fs)",
-                account.id, "ok" if result.ok else "ERRORE", result.written,
+                PROVA if dry_run else "",
+                account.id, "ok" if result.ok else "ERRORE",
+                result.candidates if dry_run else result.written,
+                "da scaricare" if dry_run else "scritti",
                 result.receipts, result.duplicates, result.examined,
                 result.remaining, result.duration,
             )
@@ -195,11 +246,35 @@ class Pipeline:
                 return
 
             metas = reader.fetch_meta(uids)
-            for uid in uids:
+            for posizione, uid in enumerate(uids):
                 meta = metas.get(uid)
+
+                # Guardia sullo spazio, prima di toccare lo stato e quindi senza
+                # consumare i tentativi del messaggio: se non c'è posto si
+                # rifiuta pulito, si annota, e il cursore resta dov'è. Alla
+                # prossima esecuzione si riprende da qui.
+                if not dry_run:
+                    ok_spazio, motivo = self._spazio(meta.size if meta else 0)
+                    if not ok_spazio:
+                        rimasti = len(uids) - posizione
+                        result.remaining += rimasti
+                        result.examined -= rimasti
+                        result.ok = False
+                        result.error = f"spazio insufficiente: {motivo}"
+                        log.error(
+                            "[%s] mi fermo a UID %s: spazio insufficiente (%s). "
+                            "%d messaggi restano sulla casella.",
+                            account.id, uid, motivo, rimasti,
+                        )
+                        if self.run_id is not None:
+                            self.state.log_error(self.run_id, account.id,
+                                                 "spazio", motivo)
+                        return
+
                 if meta and meta.size > self.cfg.max_message_bytes:
                     log.error(
-                        "[%s] UID %s ignorato: %d byte oltre il limite di %d",
+                        "%s[%s] UID %s ignorato: %d byte oltre il limite di %d",
+                        PROVA if dry_run else "",
                         account.id, uid, meta.size, self.cfg.max_message_bytes,
                     )
                     if self.run_id is not None and not dry_run:
@@ -214,9 +289,9 @@ class Pipeline:
                     continue
 
                 if dry_run:
-                    log.info("[%s] (prova) scaricherei UID %s (%s byte)",
-                             account.id, uid, meta.size if meta else "?")
-                    result.written += 1
+                    log.info("%s[%s] scaricherei UID %s (%s byte)",
+                             PROVA, account.id, uid, meta.size if meta else "?")
+                    result.candidates += 1
                     continue
 
                 self._process_message(account, reader, uidvalidity, uid, meta, result)
@@ -246,7 +321,7 @@ class Pipeline:
                     dry_run: bool) -> None:
         """Fissa la posizione di partenza senza scaricare niente."""
         if lookback_days is not None:
-            since = _today() - timedelta(days=lookback_days)
+            since = self._oggi() - timedelta(days=lookback_days)
             uids = reader.search_uids_since(since)
             last_uid = (min(uids) - 1) if uids else reader.max_uid()
             what = f"da {since.isoformat()} ({len(uids)} messaggi resteranno da scaricare)"
@@ -254,22 +329,23 @@ class Pipeline:
             last_uid = reader.max_uid()
             what = "posizione attuale, nessuno scaricamento"
         result.examined = 0
-        log.info("[%s] init: uidvalidity=%s last_uid=%s (%s)",
-                 account.id, uidvalidity, last_uid, what)
+        log.info("%s[%s] init: uidvalidity=%s last_uid=%s (%s)",
+                 PROVA if dry_run else "", account.id, uidvalidity, last_uid, what)
         if not dry_run:
             cursor = self.state.get_cursor(account.id, account.folder)
             cursor.uidvalidity = uidvalidity
             cursor.last_uid = max(0, last_uid)
             cursor.initialized = True
-            cursor.last_seen_at = utcnow()
+            cursor.last_seen_at = self.state.ora()
             self.state.save_cursor(cursor)
 
     def _select_uids(self, account: Account, reader: ImapReader, cursor,
                      uidvalidity: int, mode: str, since: date | None,
                      result: AccountResult, dry_run: bool) -> list[int]:
         if mode == MODE_BACKFILL:
-            start = since or (_today() - timedelta(days=365))
-            log.info("[%s] backfill da %s", account.id, start.isoformat())
+            start = since or (self._oggi() - timedelta(days=365))
+            log.info("%s[%s] backfill da %s", PROVA if dry_run else "",
+                     account.id, start.isoformat())
             uids = reader.search_uids_since(start)
             return self._filter_known(account, uidvalidity, uids)
 
@@ -278,10 +354,10 @@ class Pipeline:
             days = account.initial_lookback_days
             if days is None:
                 days = self.cfg.initial_lookback_days
-            start = _today() - timedelta(days=days)
-            log.info("[%s] primo avvio: prendo solo da %s (%d giorni). "
+            start = self._oggi() - timedelta(days=days)
+            log.info("%s[%s] primo avvio: prendo solo da %s (%d giorni). "
                      "Per l'archivio storico usare 'pecfetch backfill'.",
-                     account.id, start.isoformat(), days)
+                     PROVA if dry_run else "", account.id, start.isoformat(), days)
             uids = reader.search_uids_since(start)
             return self._filter_known(account, uidvalidity, uids)
 
@@ -290,12 +366,13 @@ class Pipeline:
             # più. Si risincronizza per data e la deduplica per contenuto evita
             # di riemettere quello che era già uscito.
             log.warning(
-                "[%s] UIDVALIDITY cambiata (%s -> %s): risincronizzo per data",
-                account.id, cursor.uidvalidity, uidvalidity,
+                "%s[%s] UIDVALIDITY cambiata (%s -> %s): risincronizzo per data",
+                PROVA if dry_run else "", account.id, cursor.uidvalidity,
+                uidvalidity,
             )
             result.uidvalidity_reset = True
             anchor = cursor.last_seen_date
-            start = (anchor.date() if anchor else _today()) - timedelta(
+            start = (anchor.date() if anchor else self._oggi()) - timedelta(
                 days=self.cfg.resync_overlap_days
             )
             if not dry_run:
@@ -347,14 +424,14 @@ class Pipeline:
             account.id, uidvalidity, uid, msg_id, digest, pm.msg_type,
             pm.message_id, pm.subject,
         )
-        seen_at = _iso_or_none(certified_or_best_date(pm))
+        seen_at = tempo.reso(certified_or_best_date(pm), self.tz)
 
         # Ricevute positive: rumore per il consumatore. Si registrano e basta.
         if pm.msg_type in RECEIPTS_POSITIVE or not is_output_type(pm.msg_type):
             self.state.record_receipt(
                 msg_id, account.id, pm.msg_type, pm.ref_message_id,
                 pm.subject or pm.envelope_subject, pm.gestore,
-                _iso_or_none(pm.date_certified),
+                tempo.reso(pm.date_certified, self.tz),
             )
             self.state.finish_message(account.id, uidvalidity, uid, STATUS_SKIPPED)
             self.state.advance_uid(account.id, account.folder, uidvalidity, uid, seen_at)
@@ -371,7 +448,7 @@ class Pipeline:
 
         try:
             written = self.writer.write_message(
-                pm, raw, account, msg_id, uidvalidity, uid, utcnow(),
+                pm, raw, account, msg_id, uidvalidity, uid, self.state.ora(),
                 extraction=not degraded,
             )
         except Exception as exc:
@@ -407,17 +484,6 @@ class Pipeline:
         log.info("[%s] UID %s -> %s (%s) %s", account.id, uid,
                  written.content_dir, pm.msg_type,
                  "[già presente]" if written.already_present else "")
-
-
-def _today() -> date:
-    return datetime.now(timezone.utc).date()
-
-
-def _iso_or_none(value) -> str | None:
-    try:
-        return value.isoformat()
-    except Exception:
-        return None
 
 
 __all__ = ["Pipeline", "RunSummary", "AccountResult", "MODE_RUN", "MODE_INIT",

@@ -21,8 +21,9 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+
+from pecfetch import permessi as perm, tempo
 
 SCHEMA_VERSION = 1
 
@@ -86,9 +87,12 @@ class Claim:
 
 
 class State:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, timezone_name: str = tempo.DEFAULT_TZ,
+                 permissions: perm.Permessi | None = None):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.tz = tempo.zona(timezone_name)
+        self.permessi = permissions or perm.Permessi()
+        perm.crea_dir(self.path.parent, self.permessi.dir_mode, self.permessi)
         self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -99,6 +103,7 @@ class State:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
+        perm.applica_sqlite(self.path, self.permessi)
 
     def close(self) -> None:
         try:
@@ -123,9 +128,9 @@ class State:
         else:
             self.db.execute("COMMIT")
 
-    @staticmethod
-    def _now() -> str:
-        return datetime.now().astimezone().isoformat(timespec="seconds")
+    def _now(self) -> str:
+        """Il fuso dichiarato, non quello che ha la macchina in questo momento."""
+        return tempo.ora(self.tz)
 
     # -- messaggi ---------------------------------------------------------
     def get(self, msg_id: str) -> sqlite3.Row | None:

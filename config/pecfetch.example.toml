@@ -20,8 +20,20 @@ secrets_file = "/etc/pecfetch/secrets.toml"
 # Se assente, le caselle si dichiarano qui sotto con [[accounts]].
 accounts_file = "caselle.example.toml"
 
-# Fuso orario usato per i nomi dei file d'indice e delle cartelle.
+# Fuso orario di TUTTE le date esposte: indice, metadati, archivio, stato e
+# timestamp del log, oltre ai nomi dei file d'indice e delle cartelle. Una
+# convenzione sola, dichiarata nel CONTRATTO.md scritto in output_root. Va bene
+# anche "UTC", purché resti uniforme; un fuso inesistente è un errore fatale.
 timezone = "Europe/Rome"
+
+# Sotto questa soglia di spazio libero pecfetch non comincia a scrivere un
+# messaggio: rifiuta, annota nello stato e lascia il cursore dov'è, così alla
+# prossima esecuzione (liberato lo spazio) riprende da lì. I limiti sugli
+# allegati proteggono dal singolo file patologico, questo dall'accumulo di una
+# coda che nessuno svuota. Vale sia per output_root sia per state_dir: un disco
+# pieno blocca anche le scritture di stato, che sono quelle che non possono
+# fallire.
+min_free_bytes = 1073741824   # 1 GiB
 
 
 [fetch]
@@ -96,6 +108,31 @@ max_entries = 500
 max_depth = 3
 # Dimensione massima della singola voce.
 max_member_bytes = 33554432    # 32 MiB
+
+
+[permissions]
+# Permessi dell'albero prodotto. Sono una decisione di esercizio: vedi il README.
+# Modi in ottale, fra virgolette (in TOML un intero non si scrive in base 8).
+#
+#   dir_mode / file_mode  l'albero in generale. 0750/0640 significa: il gruppo
+#                         legge, gli altri no. L'archivio PEC di uno studio non
+#                         è leggibile da chiunque abbia un account sulla VM.
+#   shared_dir_mode       coda/ ed esiti/, le uniche due cartelle in cui il
+#                         consumatore scrive: 2770 = scrittura al gruppo più
+#                         setgid, perché per spostare fuori dalla coda una
+#                         cartella lavorata serve il permesso sulla directory
+#                         che la contiene, e il setgid tiene nel gruppo giusto
+#                         ciò che il consumatore crea.
+#   group                 gruppo da assegnare ai file prodotti. Vuoto = quello
+#                         del processo (con l'unit systemd fornita, "pecfetch").
+#
+# Chi espone questa radice in sola lettura sulla rete lo fa con un servizio che
+# appartiene al gruppo: si concede l'accesso a un servizio, non a tutti. Per
+# aprire invece a chiunque legga la macchina: "0755" / "0644" / "2775".
+dir_mode = "0750"
+file_mode = "0640"
+shared_dir_mode = "2770"
+group = ""
 
 
 [archive]

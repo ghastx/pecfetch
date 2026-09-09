@@ -330,3 +330,45 @@ def test_indice_riporta_il_conteggio_delle_voci(writer, cfg, account):
     allegato = res.index_record["allegati"][0]
     assert allegato["voci"] == 2
     assert allegato["nome"] == "Fatture.zip"
+
+
+def test_record_dichiara_lo_schema_aggiornato(cfg, stack, account):
+    """La forma non cambia, il significato dei campi sì: chi legge deve saperlo."""
+    import json
+
+    _state, _archive, writer = stack
+    raw = f.busta_trasporto()
+    result = writer.write_message(parse_pec(raw), raw, account, "id1", 1, 1, "x")
+    assert result.index_record["schema"] == "pecfetch/indice/2"
+    meta = json.loads(
+        (cfg.output_root / result.content_dir / "messaggio.json").read_text("utf-8"))
+    assert meta["schema"] == "pecfetch/messaggio/2"
+
+
+def test_contratto_dichiara_fuso_permessi_e_indirizzi(cfg, stack):
+    testo = (cfg.output_root / "CONTRATTO.md").read_text(encoding="utf-8")
+    assert "Europe/Rome" in testo
+    assert "0750" in testo and "2770" in testo
+    assert "minuscolo" in testo
+
+
+def test_contratto_riscritto_se_la_convenzione_cambia(cfg, stack, tmp_path):
+    from pecfetch import permessi as perm
+    from pecfetch.extract import ExtractorSettings
+    from pecfetch.output import OutputWriter
+
+    contratto = cfg.output_root / "CONTRATTO.md"
+    assert "Europe/Rome" in contratto.read_text(encoding="utf-8")
+    OutputWriter(cfg.output_root, ExtractorSettings(enabled=False),
+                 timezone="UTC", permissions=perm.Permessi())
+    assert "UTC" in contratto.read_text(encoding="utf-8")
+
+
+def test_indirizzi_del_record_sono_minuscoli(cfg, stack, account):
+    _state, _archive, writer = stack
+    inner = f.inner_message(sender="Mario.Rossi@PEC.IT", to="LASERMARCSRL@PEC.IT")
+    raw = f.busta_trasporto(postacert=inner, to="LASERMARCSRL@PEC.IT")
+    record = writer.write_message(parse_pec(raw), raw, account, "id2", 1, 1,
+                                  "x").index_record
+    assert record["mittente"]["indirizzo"] == "mario.rossi@pec.it"
+    assert record["destinatari"] == ["lasermarcsrl@pec.it"]

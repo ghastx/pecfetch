@@ -9,6 +9,11 @@ Type=oneshot
 User=pecfetch
 Group=pecfetch
 
+# I permessi dei file prodotti li impone pecfetch con chmod espliciti; questa è
+# la rete di sicurezza per ciò che dovesse sfuggire. Se in [permissions] si
+# allarga il modello (0755/0644), qui va messo 0022.
+UMask=0027
+
 # Le password possono stare qui (permessi 600) invece che nel file dei segreti.
 # EnvironmentFile=-/etc/pecfetch/pecfetch.env
 

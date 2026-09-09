@@ -62,7 +62,9 @@ def compose(item: QueueItem, rules: RuleMatch, signals: Signals,
         mailbox=item.mailbox_label,
         sender=item.sender,
         subject=item.subject[:200],
-        date=item.date[:19],
+        # la data esce intera, offset compreso: è la stessa convenzione del
+        # record d'indice da cui viene, e troncarla la renderebbe ambigua
+        date=item.date,
         rules_applied=list(rules.matched),
         label=rules.label,
         directives=directives.stamp(),

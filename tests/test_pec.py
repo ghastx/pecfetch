@@ -169,3 +169,23 @@ def test_postacert_in_base64_viene_decodificato():
     pm = parse_pec(f.busta_trasporto())
     assert "Content-Type" not in pm.body_text
     assert pm.body_text.startswith("Si notifica")
+
+
+def test_indirizzi_sempre_minuscoli_ma_l_originale_resta():
+    """Sulle caselle vere arriva LASERMARCSRL@PEC.IT per una casella minuscola."""
+    inner = f.inner_message(sender="Mario.Rossi@PEC.IT", to="LASERMARCSRL@PEC.IT")
+    pm = parse_pec(f.busta_trasporto(postacert=inner, to="LASERMARCSRL@PEC.IT"))
+    assert pm.from_addr["address"] == "mario.rossi@pec.it"
+    assert pm.from_addr["domain"] == "pec.it"
+    assert [d["address"] for d in pm.to] == ["lasermarcsrl@pec.it"]
+    # la forma scritta dal gestore non si perde: sta negli header conservati
+    assert pm.headers["postacert.From"] == "Mario.Rossi@PEC.IT"
+    assert pm.headers["To"] == "LASERMARCSRL@PEC.IT"
+
+
+def test_indirizzi_del_daticert_normalizzati():
+    dati = f.daticert(mittente="ENTE@PEC.COMUNE.IT",
+                      destinatario="LASERMARCSRL@PEC.IT")
+    pm = parse_pec(f.busta_trasporto(dati=dati))
+    assert pm.daticert.mittente == "ente@pec.comune.it"
+    assert [d["address"] for d in pm.daticert.destinatari] == ["lasermarcsrl@pec.it"]

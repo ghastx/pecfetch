@@ -17,6 +17,7 @@ import os
 import sys
 from datetime import date
 
+from pecfetch import permessi as perm, spazio, tempo
 from pecfetch.lock import AlreadyRunning, RunLock
 from pecfetch.logging_setup import setup as setup_logging
 
@@ -135,9 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
 def _load(args) -> tuple[Config, Directives]:
     warnings: list[str] = []
     cfg = load_config(getattr(args, "config", None), warn=warnings.append)
+    # come in pecfetch: la umask non deve concedere più del modello dichiarato
+    os.umask(perm.umask_da(cfg.permissions))
     setup_logging(cfg.log_level, cfg.log_file,
                   quiet=getattr(args, "quiet", False),
-                  verbose=getattr(args, "verbose", False))
+                  verbose=getattr(args, "verbose", False),
+                  timezone_name=cfg.timezone)
     for message in warnings:
         log.warning("%s", message)
     directives = load_directives(cfg.rules_path, cfg.instructions_path)
@@ -167,7 +171,7 @@ def cmd_run(args, cfg: Config, directives: Directives) -> int:
     if args.prova:
         return _dry_run(args, cfg, directives)
 
-    with State(cfg.state_path) as state:
+    with State(cfg.state_path, cfg.timezone, cfg.permissions) as state:
         history = _open_history(cfg)
         classifier_error = ""
         try:
@@ -179,7 +183,7 @@ def cmd_run(args, cfg: Config, directives: Directives) -> int:
             classifier, classifier_error = None, str(exc)
             log.error("%s", exc)
             _out(f"! {exc}")
-        store = OutcomeStore(cfg.outcomes_dir, cfg.timezone)
+        store = OutcomeStore(cfg.outcomes_dir, cfg.timezone, cfg.permissions)
         runner = Runner(cfg, directives, state, store, classifier, history,
                         classifier_error=classifier_error)
 
@@ -290,12 +294,13 @@ def _dry_run(args, cfg: Config, directives: Directives) -> int:
 
 
 def cmd_digest(args, cfg: Config, directives: Directives) -> int:
-    day = date.fromisoformat(args.giorno) if args.giorno else date.today()
+    # il giorno del fuso dichiarato: lo stesso che nomina i file degli esiti
+    day = date.fromisoformat(args.giorno) if args.giorno else tempo.oggi(cfg.tz)
     iso = f"{day:%Y-%m-%d}"
-    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone)
+    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone, cfg.permissions)
     outcomes = store.read(since=iso, until=iso)
 
-    with State(cfg.state_path) as state:
+    with State(cfg.state_path, cfg.timezone, cfg.permissions) as state:
         # quello che è ancora in coda senza esito è, per definizione, non lavorato
         judged = {o.id for o in outcomes}
         items, problems = scan(cfg.queue_dir)
@@ -318,7 +323,7 @@ def cmd_digest(args, cfg: Config, directives: Directives) -> int:
 
 
 def cmd_explain(args, cfg: Config, directives: Directives) -> int:
-    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone)
+    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone, cfg.permissions)
     found = store.find(args.id)
     if found:
         for outcome in found:
@@ -356,7 +361,7 @@ def cmd_explain(args, cfg: Config, directives: Directives) -> int:
 
 
 def cmd_correct(args, cfg: Config, directives: Directives) -> int:
-    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone)
+    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone, cfg.permissions)
     found = store.find(args.id)
     if not found:
         _out(f"nessun esito per {args.id}: non c'è niente da correggere")
@@ -375,7 +380,7 @@ def cmd_correct(args, cfg: Config, directives: Directives) -> int:
 
 
 def cmd_register(args, cfg: Config, directives: Directives) -> int:
-    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone)
+    store = OutcomeStore(cfg.outcomes_dir, cfg.timezone, cfg.permissions)
     outcomes = store.read(days=args.giorni, since=args.da or "", until=args.a or "")
     corrections = store.read_corrections(days=args.giorni, since=args.da or "",
                                          until=args.a or "")
@@ -463,6 +468,16 @@ def cmd_check(args, cfg: Config, directives: Directives) -> int:
         elif not exists and not writable:
             problems.append(f"{label}: {path} non esiste")
 
+    # Spazio: pecdesk scrive meno di pecfetch, ma scrive nello stesso albero, e
+    # un disco pieno gli impedisce di registrare gli esiti già pagati al modello.
+    ok_spazio, motivo = spazio.sufficiente(
+        (cfg.outcomes_dir, cfg.worked_dir, cfg.state_dir), spazio.DEFAULT_MIN_FREE_BYTES)
+    if ok_spazio:
+        _out(f"  spazio     {spazio.leggibile(spazio.liberi(cfg.output_root))} liberi")
+    else:
+        _out(f"  spazio     SOTTO SOGLIA - {motivo}")
+        problems.append(f"spazio insufficiente: {motivo}")
+
     try:
         from pecfetch.archive import Archive
 
@@ -511,7 +526,7 @@ def cmd_check(args, cfg: Config, directives: Directives) -> int:
 
 
 def cmd_state(args, cfg: Config, directives: Directives) -> int:
-    with State(cfg.state_path) as state:
+    with State(cfg.state_path, cfg.timezone, cfg.permissions) as state:
         stats = state.stats()
         _out(json.dumps(stats, ensure_ascii=False, indent=1))
         suspended = state.suspended()
@@ -529,7 +544,7 @@ def cmd_state(args, cfg: Config, directives: Directives) -> int:
 
 
 def cmd_retry(args, cfg: Config, directives: Directives) -> int:
-    with State(cfg.state_path) as state:
+    with State(cfg.state_path, cfg.timezone, cfg.permissions) as state:
         for msg_id in args.id:
             ok = state.retry(msg_id)
             _out(f"{msg_id}: {'sbloccato' if ok else 'sconosciuto'}")
@@ -566,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_FATAL
 
     try:
-        with RunLock(cfg.lock_path):
+        with RunLock(cfg.lock_path, cfg.permissions):
             return handler(args, cfg, directives)
     except AlreadyRunning as exc:
         print(f"pecdesk: {exc}", file=sys.stderr)

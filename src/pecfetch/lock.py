@@ -7,19 +7,22 @@ import fcntl
 import os
 from pathlib import Path
 
+from . import permessi as perm
+
 
 class AlreadyRunning(Exception):
     """Un'altra esecuzione di pecfetch è già in corso."""
 
 
 class RunLock:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, permissions: perm.Permessi | None = None):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.permessi = permissions or perm.Permessi()
+        perm.crea_dir(self.path.parent, self.permessi.dir_mode, self.permessi)
         self._fd: int | None = None
 
     def acquire(self) -> None:
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, self.permessi.file_mode)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:

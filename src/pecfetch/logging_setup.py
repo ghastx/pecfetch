@@ -6,7 +6,10 @@ import logging
 import logging.handlers
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
+
+from . import tempo
 
 _SECRET_RE = re.compile(
     r"(?i)\b(password|passwd|pwd|token|secret|api[-_ ]?key|x-api-key)\b\s*[:=]\s*\S+"
@@ -34,8 +37,28 @@ class RedactFilter(logging.Filter):
         return True
 
 
+class _Formatter(logging.Formatter):
+    """Timestamp nel fuso dichiarato, con l'offset scritto.
+
+    Il default di `logging` è l'ora locale della macchina, senza dirlo: un log
+    letto dopo un cambio di fuso, o su una macchina configurata diversamente,
+    non si può più mettere in relazione con le date dei dati.
+    """
+
+    def __init__(self, fmt: str, tz) -> None:
+        super().__init__(fmt)
+        self.tz = tz
+
+    def formatTime(self, record, datefmt=None) -> str:
+        when = datetime.fromtimestamp(record.created, self.tz)
+        if when.tzinfo is None:      # ripiego: l'ora della macchina, ma dichiarata
+            when = when.astimezone()
+        return when.strftime(datefmt or "%Y-%m-%d %H:%M:%S%z")
+
+
 def setup(level: str = "INFO", log_file: Path | None = None,
-          quiet: bool = False, verbose: bool = False) -> logging.Logger:
+          quiet: bool = False, verbose: bool = False,
+          timezone_name: str = tempo.DEFAULT_TZ) -> logging.Logger:
     root = logging.getLogger()
     for handler in list(root.handlers):
         root.removeHandler(handler)
@@ -45,10 +68,13 @@ def setup(level: str = "INFO", log_file: Path | None = None,
         numeric = logging.DEBUG
     root.setLevel(numeric)
 
-    fmt = logging.Formatter(
-        "%(asctime)s %(levelname)-7s %(name)-18s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    try:
+        tz = tempo.zona(timezone_name)
+    except ValueError:
+        # il fuso è già validato in configurazione; se qui è sbagliato siamo
+        # prima del caricamento e l'ora della macchina è meglio di niente
+        tz = None
+    fmt = _Formatter("%(asctime)s %(levelname)-7s %(name)-18s %(message)s", tz)
     redact = RedactFilter()
 
     console = logging.StreamHandler(sys.stderr)

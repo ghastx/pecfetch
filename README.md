@@ -111,6 +111,40 @@ dimensione ed esito dell'estrazione, `message_id`, identificativo PEC, gestore,
 riferimento al messaggio originale per le ricevute, e i puntatori al contenuto
 completo. Sta sotto i 2 KB: mille messaggi si leggono in un colpo solo.
 
+### Date: una convenzione sola
+
+**Tutte** le date esposte sono ISO 8601 con l'offset del fuso configurato in
+`[general].timezone` (per default `Europe/Rome`), precisione al secondo:
+`2026-09-05T10:31:00+02:00`. Non c'è nessun campo in UTC e nessun campo senza
+offset, quindi due date dello stesso albero si confrontano fra loro senza
+conversioni a mente. Vale per `data.certificata`, `data.invio`,
+`data.ricezione`, `acquisito_il`, per l'archivio, per lo stato locale e per i
+timestamp del log; i nomi dei file d'indice e delle cartelle usano lo stesso
+fuso, quindi il giorno del nome è il giorno della data.
+
+L'offset dichiarato dal gestore resta comunque leggibile in `daticert.xml` e
+`busta.eml`, che non vengono mai riscritti: cambia la resa, non l'istante.
+`timezone = "UTC"` è altrettanto legittimo, purché resti uno solo; un fuso
+inesistente è un errore fatale al caricamento, non un ripiego silenzioso.
+
+Ordinare stringhe ISO con lo stesso offset è corretto **tranne** nell'ora del
+ritorno all'ora solare, quando `02:30+02:00` precede `02:30+01:00` ma ordina
+dopo. Dove l'ordine conta — cursore di stato, ordine della coda di pecdesk — si
+confrontano istanti e non stringhe; resta un possibile scarto di un'ora sui
+soli filtri `--since`/`--until` dell'archivio, due volte l'anno. Con `UTC` non
+esisterebbe: è il prezzo della leggibilità, dichiarato.
+
+### Indirizzi: sempre minuscoli
+
+Gli indirizzi esposti (`mittente.indirizzo`, `destinatari`, `copia`,
+`casella.indirizzo`, `daticert.*`) sono sempre in minuscolo, parte locale
+compresa: nessun gestore PEC italiano tratta le caselle come sensibili alle
+maiuscole, e sulle caselle vere capita di ricevere `LASERMARCSRL@PEC.IT` per una
+casella configurata in minuscolo. Normalizzare all'origine è l'unico modo per
+non lasciare in giro corrispondenze mancate sporadiche. La forma scritta dal
+mittente non si perde: resta negli header conservati in `messaggio.json`
+(`header.From`, `header.postacert.From`) e integra dentro `busta.eml`.
+
 Le **ricevute positive** (accettazione, presa in carico, avvenuta consegna) non
 compaiono in output: sono registrate nello stato locale (`pecfetch receipts`).
 Le **ricevute negative** escono, collegate al messaggio originale via
@@ -128,12 +162,13 @@ pecfetch check --login          # configurazione, strumenti, collegamenti
 pecfetch init                   # fissa la posizione attuale, non scarica nulla
 pecfetch init --lookback-days 7 # ...oppure parti da 7 giorni fa
 pecfetch run                    # uso normale (systemd timer)
-pecfetch run --dry-run          # cosa scaricherebbe
+pecfetch run --dry-run          # cosa scaricherebbe, senza toccare l'output
 pecfetch backfill --since 2024-01-01 -a rossi   # archivio storico, esplicito
 pecfetch status                 # cursori, ultime esecuzioni, errori
 pecfetch search "avviso accertamento" --client ROSSI --since 2024-01-01
 pecfetch receipts               # ricevute positive registrate
 pecfetch parse busta.eml        # diagnostica su un .eml locale, senza IMAP
+pecfetch cleanup --permessi     # riapplica i permessi all'albero già prodotto
 ```
 
 Codici di uscita: `0` tutto bene, `2` completato con caselle in errore, `1`
@@ -167,6 +202,67 @@ Installazione e configurazione: [`deploy/INSTALL.md`](deploy/INSTALL.md) e
   falliti sullo stesso messaggio, viene scritto comunque senza estrazione del
   testo, con la nota nei metadati. Meglio un messaggio incompleto in coda che
   una casella bloccata per sempre su un PDF malato.
+
+## Permessi dei file prodotti
+
+È una decisione di esercizio, non un dettaglio: qui c'è la scelta e le sue
+conseguenze. Il modello sta in `[permissions]`, si applica a ogni scrittura con
+`chmod` espliciti e **non dipende dalla umask** del processo o del servizio.
+
+| | |
+|---|---|
+| cartelle | `0750` |
+| file | `0640` |
+| `coda/` ed `esiti/` | `2770` |
+
+Due fatti dell'ambiente reale lo determinano.
+
+**Il consumatore è un altro programma con un'altra identità.** `pecdesk` gira
+come utente proprio con gruppo primario `pecfetch`: legge la coda, sposta fuori
+le cartelle lavorate e scrive in `esiti/`. Spostare una cartella richiede il
+permesso di scrittura sulla *directory che la contiene*, non sulla cartella:
+per questo `coda/` ed `esiti/` sono a `2770` e non a `0750`. Il bit setgid
+mantiene nel gruppo giusto ciò che il consumatore crea, senza dipendere dal suo
+gruppo primario. Il permesso sul filesystem non basta da solo: `coda/` deve
+comparire anche fra i `ReadWritePaths` dell'unit di pecdesk, altrimenti
+`ProtectSystem=strict` la monta in sola lettura.
+
+**La radice può essere esposta in sola lettura a chi la sfoglia dalla rete.**
+Qui la scelta è restrittiva: «altri» non ha alcun accesso. Chi espone la
+cartella lo fa con un servizio (Samba, NFS, un visualizzatore web) che gira con
+un utente appartenente al gruppo `pecfetch`. Si concede l'accesso a un servizio
+identificabile, non a chiunque abbia un account sulla macchina — e l'albero
+contiene corrispondenza legale di clienti dello studio. Per aprire comunque a
+tutti basta `dir_mode = "0755"`, `file_mode = "0644"`, `shared_dir_mode = "2775"`.
+
+Conseguenze pratiche da conoscere:
+
+* `/srv/pec/dati` e `/var/lib/pecfetch` vanno a `0750`: senza il permesso di
+  attraversamento sulla radice, i permessi interni non contano.
+* L'archivio storico (`archivio.sqlite3`) esce a `0640` **insieme ai sidecar
+  `-wal` e `-shm`**: pecdesk lo apre in `mode=ro` e senza il WAL non lo legge.
+* `esiti/` è del consumatore: pecfetch ne fissa i permessi della cartella e non
+  tocca mai i file che ci sono dentro, nemmeno per correggerli.
+* `pecfetch check` confronta l'albero con il modello e segnala le divergenze;
+  `pecfetch cleanup --permessi` le corregge. Serve dopo un aggiornamento: le
+  cartelle scritte prima di questa versione hanno i permessi che capitavano
+  (`0700` la cartella del messaggio, `0775`/`0664` dentro).
+* Il gruppo dei file si può forzare con `[permissions].group`; vuoto significa
+  «quello del processo», che con le unit fornite è già `pecfetch`.
+
+## Spazio su disco
+
+Prima di cominciare a scrivere un messaggio pecfetch verifica che restino
+almeno `[general].min_free_bytes` liberi (1 GiB per default) **sia** su
+`output_root` **sia** su `state_dir`. Sotto soglia si ferma pulito: non scrive,
+non avanza il cursore, annota l'errore nello stato (`pecfetch status` lo mostra)
+e lascia i messaggi sulla casella. Liberato lo spazio, la prossima esecuzione
+riprende da dove si era fermata.
+
+I limiti su allegati e archivi proteggono dal singolo file patologico; questo
+protegge dall'accumulo di una coda che nessuno svuota. La distinzione conta
+perché un filesystem pieno non blocca solo la scrittura del messaggio: blocca
+anche le scritture di stato, cioè la parte che non può fallire.
 
 ## Allegati ostili
 
@@ -380,6 +476,15 @@ non spostato viene semplicemente spostato.
 Il riepilogo si **prenota prima di partire**: l'effetto si registra prima di
 produrlo, quindi al massimo una volta al giorno. Un invio interrotto non si
 ripete da solo (`pecdesk riepilogo --forza`).
+
+**Uscire dalla coda richiede il permesso sulla coda.** Il passo 6 è un
+`rename`, e spostare una cartella richiede il permesso di scrittura sulla
+*directory che la contiene*: `coda/` è a `2770` e deve comparire fra i
+`ReadWritePaths` dell'unit di pecdesk, altrimenti `ProtectSystem=strict` la
+monta in sola lettura. Se lo spostamento non riesce, pecdesk lo dice e lascia il
+messaggio dov'è: non copia in `lavorati/` senza svuotare la coda, perché sarebbe
+un duplicato silenzioso ripetuto a ogni esecuzione. L'esito è già scritto, e lo
+spostamento viene ritentato alla prossima esecuzione.
 
 **Degradare, non fingere.** Un errore transitorio lascia il messaggio in coda e
 lo annota; una richiesta non valida lo sospende senza ritentare; un guasto

@@ -33,7 +33,16 @@ La cartella di output va creata e resa scrivibile a `pecfetch`:
 ```sh
 mkdir -p /srv/pec/dati
 chown pecfetch:pecfetch /srv/pec/dati
+chmod 0750 /srv/pec/dati
+chmod 0750 /var/lib/pecfetch     # l'archivio storico lo legge il gruppo, non tutti
 ```
+
+I permessi dentro l'albero li impone pecfetch a ogni scrittura, secondo
+`[permissions]` nella configurazione: cartelle `0750`, file `0640`, e `coda/`
+ed `esiti/` a `2770` perché il consumatore deve poterci scrivere. Non dipendono
+dalla umask, e `pecfetch check` segnala se qualcosa nell'albero se ne discosta.
+Chi aggiorna da una versione precedente riporta l'albero già prodotto al
+modello con `pecfetch cleanup --permessi`.
 
 I dati restano in locale e lì vengono elaborati dal componente a valle.
 L'atomicità della coda si regge su un `rename`, quindi lo staging
@@ -111,7 +120,7 @@ mkdir -p /etc/pecdesk/direttive /var/log/pecdesk /var/lib/pecdesk/riepiloghi
 chown pecdesk:pecdesk /var/lib/pecdesk /var/log/pecdesk /var/lib/pecdesk/riepiloghi
 mkdir -p /srv/pec/dati/esiti /srv/pec/dati/lavorati
 chown pecdesk:pecfetch /srv/pec/dati/esiti /srv/pec/dati/lavorati
-chmod 2775 /srv/pec/dati/esiti /srv/pec/dati/lavorati
+chmod 2770 /srv/pec/dati/esiti /srv/pec/dati/lavorati
 ```
 
 `coda/` resta di proprietà di `pecfetch`, ma il gruppo deve poterci scrivere:
@@ -119,8 +128,13 @@ pecdesk non modifica i file, però sposta le cartelle lavorate fuori dalla coda,
 e per farlo serve il permesso di scrittura sulla directory che le contiene.
 
 ```sh
-chmod 2775 /srv/pec/dati/coda
+chmod 2770 /srv/pec/dati/coda
 ```
+
+Il permesso sul filesystem non basta: `coda/` deve comparire anche fra i
+`ReadWritePaths` dell'unit di pecdesk (c'è già in `deploy/pecdesk.service`),
+altrimenti `ProtectSystem=strict` la monta in sola lettura e lo spostamento
+fallisce.
 
 L'archivio storico invece si legge e basta: l'unit systemd lo monta in sola
 lettura, e il codice lo apre comunque con `mode=ro`.

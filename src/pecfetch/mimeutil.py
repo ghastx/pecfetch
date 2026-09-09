@@ -141,11 +141,18 @@ def parse_addresses(raw: object) -> list[dict]:
         name = (name or "").strip().strip('"').strip()
         if not addr and not name:
             continue
-        key = addr.lower() or name.lower()
+        # Gli indirizzi escono sempre in minuscolo, parte locale compresa:
+        # nessun gestore PEC italiano tratta le caselle come sensibili alle
+        # maiuscole, e un LASERMARCSRL@PEC.IT che non corrisponde alla stessa
+        # casella scritta minuscola produce corrispondenze mancate sporadiche e
+        # difficili da diagnosticare. La forma originale non si perde: resta
+        # negli header conservati nei metadati e integra dentro busta.eml.
+        addr = addr.lower()
+        key = addr or name.lower()
         if key in seen:
             continue
         seen.add(key)
-        domain = addr.rsplit("@", 1)[-1].lower() if "@" in addr else ""
+        domain = addr.rsplit("@", 1)[-1] if "@" in addr else ""
         out.append({"name": name, "address": addr, "domain": domain})
     return out
 
@@ -175,15 +182,6 @@ def parse_date(raw: object) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
-
-
-def iso(dt: datetime | None) -> str | None:
-    if dt is None:
-        return None
-    try:
-        return dt.isoformat()
-    except Exception:
-        return None
 
 
 def payload_bytes(part: Message) -> bytes:

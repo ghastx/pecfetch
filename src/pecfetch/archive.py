@@ -15,9 +15,13 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+from . import permessi as perm
+
+#: 2: indirizzi normalizzati in minuscolo. La forma non cambia, i confronti sì.
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -78,6 +82,23 @@ CREATE TABLE IF NOT EXISTS fts_map (
 """
 
 
+def _giu(value: object) -> str:
+    """Le colonne di indirizzo si confrontano con `=`: qui dentro sono minuscole.
+
+    Il record che arriva è già normalizzato; questa è la seconda difesa, per i
+    record scritti da una versione precedente e ripassati dall'archivio.
+    """
+    return str(value or "").lower()
+
+
+def _giorno_dopo(giorno: str) -> str:
+    """`AAAA-MM-GG` -> il giorno successivo, per un estremo superiore aperto."""
+    try:
+        return (date.fromisoformat(giorno) + timedelta(days=1)).isoformat()
+    except ValueError:
+        return giorno
+
+
 @dataclass
 class SearchHit:
     id: str
@@ -99,9 +120,11 @@ class Archive:
     non a livello di buone intenzioni.
     """
 
-    def __init__(self, path: str | Path, read_only: bool = False):
+    def __init__(self, path: str | Path, read_only: bool = False,
+                 permissions: perm.Permessi | None = None):
         self.path = Path(path)
         self.read_only = read_only
+        self.permessi = permissions or perm.Permessi()
         if read_only:
             if not self.path.exists():
                 raise FileNotFoundError(f"archivio non trovato: {self.path}")
@@ -111,16 +134,41 @@ class Archive:
             )
             self.db.row_factory = sqlite3.Row
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        perm.crea_dir(self.path.parent, self.permessi.dir_mode, self.permessi)
         self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(_SCHEMA)
+        self._migra()
         self.db.execute(
             "INSERT INTO meta(key,value) VALUES('schema_version',?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
+        )
+        perm.applica_sqlite(self.path, self.permessi)
+
+    def _migra(self) -> None:
+        """Porta al modello corrente un archivio scritto da una versione prima.
+
+        Le righe già scritte portano l'indirizzo come lo aveva scritto il
+        gestore: finché restano così, una ricerca per mittente in minuscolo non
+        le trova, e il segnale «mittente mai visto» del consumatore scatta a
+        vuoto proprio sui mittenti che hanno già scritto.
+        """
+        try:
+            row = self.db.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.Error:
+            return
+        precedente = int(row["value"]) if row and str(row["value"]).isdigit() else 0
+        if not precedente or precedente >= 2:
+            return
+        self.db.execute(
+            "UPDATE messages SET from_addr=lower(from_addr), "
+            "from_domain=lower(from_domain), "
+            "mailbox_address=lower(mailbox_address), to_addrs=lower(to_addrs)"
         )
 
     def close(self) -> None:
@@ -175,15 +223,15 @@ class Archive:
                 """,
                 (
                     msg_id, mailbox.get("id", ""), mailbox.get("cliente", ""),
-                    mailbox.get("etichetta", ""), mailbox.get("indirizzo", ""),
+                    mailbox.get("etichetta", ""), _giu(mailbox.get("indirizzo", "")),
                     record.get("tipo", ""), int(bool(record.get("certificato"))),
                     receipt.get("tipo"), receipt.get("classe"),
                     receipt.get("riferimento_message_id"),
                     dates.get("certificata"), dates.get("invio"),
                     record.get("acquisito_il", ""),
-                    sender.get("indirizzo", ""), sender.get("nome", ""),
-                    sender.get("dominio", ""),
-                    ", ".join(record.get("destinatari", [])),
+                    _giu(sender.get("indirizzo", "")), sender.get("nome", ""),
+                    _giu(sender.get("dominio", "")),
+                    _giu(", ".join(record.get("destinatari", []))),
                     record.get("oggetto", ""), record.get("message_id", ""),
                     record.get("identificativo_pec", ""), record.get("gestore", ""),
                     content.get("cartella", ""), index_file,
@@ -247,8 +295,16 @@ class Archive:
             where.append("COALESCE(m.date_certified, m.fetched_at) >= ?")
             params.append(since)
         if until:
-            where.append("COALESCE(m.date_certified, m.fetched_at) <= ?")
-            params.append(until + "T23:59:59+99:99" if len(until) == 10 else until)
+            if len(until) == 10:
+                # estremo aperto sul giorno successivo: tutte le date escono
+                # nello stesso fuso, quindi il confronto fra stringhe basta e
+                # non serve più il vecchio "+99:99", che era solo un trucco per
+                # ordinare sopra qualunque offset
+                where.append("COALESCE(m.date_certified, m.fetched_at) < ?")
+                params.append(_giorno_dopo(until))
+            else:
+                where.append("COALESCE(m.date_certified, m.fetched_at) <= ?")
+                params.append(until)
         if msg_type:
             where.append("m.msg_type = ?")
             params.append(msg_type)

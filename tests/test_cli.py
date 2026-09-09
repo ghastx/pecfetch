@@ -99,3 +99,45 @@ def test_receipts_vuote(config_file, capsys):
 
 def test_backfill_con_data_invalida(config_file):
     assert main(["-c", str(config_file), "backfill", "--since", "ieri"]) == EXIT_FATAL
+
+
+def test_check_dichiara_fuso_permessi_e_spazio(config_file, capsys):
+    codice = main(["-c", str(config_file), "check"])
+    out = capsys.readouterr().out
+    assert "fuso orario    : Europe/Rome" in out
+    assert "cartelle 0750, file 0640" in out
+    assert "spazio libero" in out
+    assert codice in (EXIT_OK, 2)
+
+
+def test_check_lingue_ocr_col_conteggio(config_file, capsys, monkeypatch):
+    from pecfetch import cli
+
+    monkeypatch.setattr(cli, "available_tools", lambda: {
+        "tesseract": True, "tesseract_langs": ["eng", "ita", "osd"],
+        "pdftotext": True, "pypdf": True, "pdfminer": True,
+        "pdftoppm": True, "openssl": True,
+    })
+    main(["-c", str(config_file), "check"])
+    out = capsys.readouterr().out
+    assert "lingue OCR   (3) eng, ita, osd" in out
+    assert "List" not in out
+
+
+def test_cleanup_permessi_sistema_l_albero(config_file, tmp_path, capsys):
+    import os
+    import stat
+
+    from pecfetch.cli import EXIT_OK as OK
+
+    radice = tmp_path / "condivisa"
+    (radice / "coda" / "vecchia").mkdir(parents=True)
+    (radice / "coda" / "vecchia" / "messaggio.json").write_text("{}", encoding="utf-8")
+    os.chmod(radice / "coda" / "vecchia", 0o700)          # come le versioni prima
+    os.chmod(radice / "coda" / "vecchia" / "messaggio.json", 0o664)
+
+    assert main(["-c", str(config_file), "cleanup", "--permessi"]) == OK
+    assert "permessi riapplicati" in capsys.readouterr().out
+    assert stat.S_IMODE((radice / "coda" / "vecchia").stat().st_mode) == 0o750
+    assert stat.S_IMODE(
+        (radice / "coda" / "vecchia" / "messaggio.json").stat().st_mode) == 0o640

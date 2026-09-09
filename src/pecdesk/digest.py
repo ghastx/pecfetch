@@ -127,6 +127,8 @@ class Digest:
 def build(outcomes, unworked=None, day: date | None = None,
           notes=None) -> Digest:
     """Ordina gli esiti per urgenza. Un messaggio compare in una sezione sola."""
+    # i chiamanti passano sempre il giorno del fuso dichiarato; questo è solo
+    # il ripiego per l'uso diretto della funzione
     digest = Digest(day=day or date.today(), unworked=list(unworked or []),
                     notes=list(notes or []))
     for outcome in outcomes:

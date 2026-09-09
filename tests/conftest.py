@@ -131,13 +131,14 @@ def cfg(tmp_path, account) -> Config:
 
 @pytest.fixture
 def stack(cfg):
-    state = State(cfg.state_dir / "stato.sqlite3")
-    archive = Archive(cfg.archive_path)
+    state = State(cfg.state_dir / "stato.sqlite3", cfg.timezone, cfg.permissions)
+    archive = Archive(cfg.archive_path, permissions=cfg.permissions)
     writer = OutputWriter(
         cfg.output_root, ExtractorSettings.from_config(cfg),
         body_max_chars=cfg.body_max_chars,
         attachment_store_max_bytes=cfg.attachment_store_max_bytes,
         timezone=cfg.timezone,
+        permissions=cfg.permissions,
     )
     yield state, archive, writer
     archive.close()

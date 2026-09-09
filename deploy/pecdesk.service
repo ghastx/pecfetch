@@ -7,7 +7,11 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=pecdesk
+# gruppo primario pecfetch: è così che pecdesk legge la coda e ci scrive dentro
 Group=pecfetch
+
+# Come per pecfetch: rete di sicurezza, i modi veri li impone il programma.
+UMask=0027
 
 # La chiave API e la password SMTP stanno qui (permessi 600) oppure nei file
 # indicati da api_key_file / smtp_password_file. Mai nel repository.
@@ -38,7 +42,11 @@ LockPersonality=true
 # L'archivio di pecfetch è montato in sola lettura: pecdesk non deve poterci
 # scrivere nemmeno se un giorno il codice sbagliasse.
 ReadOnlyPaths=/var/lib/pecfetch
-ReadWritePaths=/var/lib/pecdesk /var/log/pecdesk /srv/pec/dati/esiti /srv/pec/dati/lavorati
+# coda/ serve in scrittura: pecdesk non modifica i file, ma SPOSTA fuori dalla
+# coda le cartelle lavorate, e per farlo serve il permesso sulla directory che
+# le contiene. Senza questa riga il rename fallisce con EROFS e la coda non si
+# svuota più.
+ReadWritePaths=/var/lib/pecdesk /var/log/pecdesk /srv/pec/dati/coda /srv/pec/dati/esiti /srv/pec/dati/lavorati
 
 [Install]
 WantedBy=multi-user.target

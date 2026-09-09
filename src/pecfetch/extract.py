@@ -677,6 +677,23 @@ def _cap(result: ExtractionResult, settings: ExtractorSettings) -> ExtractionRes
     return result
 
 
+#: un codice di lingua di tesseract: `ita`, `osd`, `chi_sim`, `script/Latin`
+_LANG_RE = re.compile(r"^[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)?$")
+
+
+def _parse_langs(out: str) -> list[str]:
+    """Le lingue installate, senza l'intestazione.
+
+    `tesseract --list-langs` stampa prima una riga di intestazione — «List of
+    available languages (3):» — e poi un codice per riga. Spezzarla in parole
+    faceva finire `List`, `of` e `(3):` fra le lingue disponibili.
+    """
+    righe = [r.strip() for r in out.splitlines()]
+    if righe and not _LANG_RE.match(righe[0]):
+        righe = righe[1:]        # l'intestazione, quando c'è
+    return sorted({r for r in righe if _LANG_RE.match(r)})[:40]
+
+
 def available_tools() -> dict:
     """Diagnostica per `pecfetch check`."""
     tools = {t: _have(t) for t in ("pdftotext", "pdftoppm", "tesseract", "openssl")}
@@ -684,10 +701,10 @@ def available_tools() -> dict:
         tools[mod.split(".")[0]] = _optional_import(mod) is not None
     if tools.get("tesseract"):
         try:
-            _code, out, _err = _run(["tesseract", "--list-langs"], 20)
-            tools["tesseract_langs"] = sorted(
-                l for l in decode_bytes(out).split() if len(l) <= 8
-            )[:40]
+            code, out, _err = _run(["tesseract", "--list-langs"], 20)
+            tools["tesseract_langs"] = (
+                [] if code != 0 else _parse_langs(decode_bytes(out))
+            )
         except Exception:
             tools["tesseract_langs"] = []
     return tools

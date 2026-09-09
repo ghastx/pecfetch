@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from pecfetch import permessi as perm, tempo
+
 DIR_QUEUE = "coda"
 FILE_METADATA = "messaggio.json"
 FILE_BODY = "corpo.txt"
@@ -104,7 +106,8 @@ class QueueItem:
 
     @property
     def mailbox_address(self) -> str:
-        return str(self.record.get("casella", {}).get("indirizzo", ""))
+        # come sender e sender_domain: gli indirizzi si confrontano minuscoli
+        return str(self.record.get("casella", {}).get("indirizzo", "")).lower()
 
     @property
     def msg_type(self) -> str:
@@ -128,7 +131,7 @@ class QueueItem:
 
     @property
     def recipients(self) -> list[str]:
-        return [str(a) for a in self.record.get("destinatari", []) if a]
+        return [str(a).lower() for a in self.record.get("destinatari", []) if a]
 
     @property
     def subject(self) -> str:
@@ -235,15 +238,24 @@ def scan(queue_dir: Path, limit: int | None = None) -> tuple[list[QueueItem], li
         except QueueError as exc:
             problems.append(str(exc))
     # il nome della cartella comincia con la data: l'ordine alfabetico è
-    # cronologico, ma non ci si appoggia e si riordina sul dato vero
-    items.sort(key=lambda it: (it.date or "", it.dir_name))
+    # cronologico, ma non ci si appoggia e si riordina sul dato vero. Si
+    # confrontano istanti e non stringhe, perché due date con lo stesso fuso si
+    # ordinano bene alfabeticamente tranne nell'ora del ritorno all'ora solare.
+    items.sort(key=_ordine)
     if limit is not None:
         items = items[:limit]
     return items, problems
 
 
+def _ordine(item: "QueueItem") -> tuple:
+    """Chiave di ordinamento cronologica, con ripiego sul nome della cartella."""
+    quando = tempo.letto(item.date)
+    return ((0, quando.timestamp()) if quando else (1, 0.0), item.dir_name)
+
+
 def move_to_worked(item_path: Path, worked_dir: Path,
-                   when: datetime | None = None) -> Path:
+                   when: datetime | None = None,
+                   permissions: perm.Permessi | None = None) -> Path:
     """Sposta la cartella fuori dalla coda. Il contenuto resta intatto.
 
     Il contratto di pecfetch autorizza esplicitamente il consumatore a spostare
@@ -251,9 +263,10 @@ def move_to_worked(item_path: Path, worked_dir: Path,
     la verità su cosa è stato scaricato sta nel suo stato locale.
     """
     item_path = Path(item_path)
-    when = when or datetime.now()
+    permissions = permissions or perm.Permessi()
+    when = when or datetime.now().astimezone()
     target_dir = Path(worked_dir) / f"{when:%Y-%m-%d}"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    perm.crea_dir(target_dir, permissions.shared_dir_mode, permissions)
     target = target_dir / item_path.name
     if target.exists():
         # già spostato da un'esecuzione interrotta: non si duplica e non si
@@ -267,6 +280,17 @@ def move_to_worked(item_path: Path, worked_dir: Path,
         # filesystem diversi (worked_dir spostata altrove): copia e cancella
         shutil.copytree(item_path, target)
         shutil.rmtree(item_path, ignore_errors=True)
+        if item_path.exists():
+            # Copiato ma non cancellato: il caso vero è coda/ montata in sola
+            # lettura dall'unit systemd. Se restasse silenzioso, ogni esecuzione
+            # ricopierebbe le stesse cartelle in lavorati/ senza mai svuotare la
+            # coda, e nessuno se ne accorgerebbe.
+            shutil.rmtree(target, ignore_errors=True)
+            raise QueueError(
+                f"{item_path.name}: copiato in {target_dir} ma non rimosso dalla "
+                f"coda. Serve il permesso di scrittura su {item_path.parent} "
+                f"(e la cartella fra i ReadWritePaths dell'unit systemd)."
+            )
     return target
 
 

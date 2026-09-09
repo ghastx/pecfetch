@@ -200,3 +200,57 @@ def test_accounts_file_illeggibile_da_errore_di_configurazione(tmp_path, monkeyp
     (tmp_path / "caselle.toml").mkdir()
     with pytest.raises(ConfigError):
         load_config(_scrivi(tmp_path, extra='accounts_file = "caselle.toml"'))
+
+
+def test_indirizzo_della_casella_normalizzato(tmp_path, monkeypatch):
+    """Configurata in maiuscolo o in minuscolo è la stessa casella."""
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    path = tmp_path / "pecfetch.toml"
+    path.write_text(
+        BASE.format(root=tmp_path, cred='password_env = "PECFETCH_TEST_PW"', extra="")
+        .replace("rossi@pec.it", "ROSSI@PEC.IT"),
+        encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.accounts[0].address == "rossi@pec.it"
+    # lo username no: è quello che si manda al gestore, non un dato del contratto
+    assert cfg.accounts[0].username == "ROSSI@PEC.IT"
+
+
+def test_due_caselle_sullo_stesso_indirizzo_sono_un_errore(tmp_path, monkeypatch):
+    """Sarebbero due cursori che si ignorano sulla stessa casella."""
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    path = tmp_path / "pecfetch.toml"
+    path.write_text(
+        BASE.format(root=tmp_path, cred='password_env = "PECFETCH_TEST_PW"', extra="")
+        + '\n[[accounts]]\nid = "rossi2"\naddress = "ROSSI@PEC.IT"\n'
+          'host = "imaps.pec.aruba.it"\npassword_env = "PECFETCH_TEST_PW"\n',
+        encoding="utf-8")
+    with pytest.raises(ConfigError, match="già dichiarato"):
+        load_config(path)
+
+
+def test_casella_cercata_senza_badare_alle_maiuscole(tmp_path, monkeypatch):
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    cfg = load_config(_scrivi(tmp_path))
+    assert cfg.account_by_id("ROSSI") is cfg.accounts[0]
+    assert cfg.account_by_id("bianchi") is None
+
+
+def test_permessi_e_spazio_hanno_un_default_dichiarato(tmp_path, monkeypatch):
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    cfg = load_config(_scrivi(tmp_path))
+    assert (cfg.permissions.dir_mode, cfg.permissions.file_mode) == (0o750, 0o640)
+    assert cfg.permissions.shared_dir_mode == 0o2770
+    assert cfg.min_free_bytes == 1024 * 1024 * 1024
+    assert "0750" in redacted(cfg)["permissions"]
+
+
+def test_permessi_configurabili(tmp_path, monkeypatch):
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    path = _scrivi(tmp_path)
+    path.write_text(path.read_text(encoding="utf-8")
+                    + '\n[permissions]\ndir_mode = "0755"\nfile_mode = "0644"\n'
+                      'shared_dir_mode = "2775"\n', encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.permissions.dir_mode == 0o755
+    assert cfg.permissions.shared_dir_mode == 0o2775

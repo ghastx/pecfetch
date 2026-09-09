@@ -1,11 +1,14 @@
 """Comportamento di un'esecuzione, senza alcun server IMAP reale."""
 
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import factories as f
 from conftest import FakeMailbox
 
+from pecfetch.extract import ExtractorSettings
+from pecfetch.output import OutputWriter
 from pecfetch.pipeline import MODE_BACKFILL, MODE_INIT, MODE_RUN
 from pecfetch.state import STATUS_DONE, STATUS_SKIPPED
 
@@ -310,14 +313,42 @@ def test_limite_per_esecuzione(cfg, stack, make_pipeline):
     assert make_pipeline({"rossi": box}).run(MODE_RUN, limit=2).written == 2
 
 
-def test_dry_run_non_scrive_nulla(cfg, stack, make_pipeline):
+def test_dry_run_non_scrive_nulla(cfg, stack, make_pipeline, caplog):
     state = stack[0]
     box = FakeMailbox()
     box.add(f.busta_trasporto(), _oggi())
-    summary = make_pipeline({"rossi": box}).run(MODE_RUN, dry_run=True)
-    assert summary.written == 1          # "scaricherei"
+    with caplog.at_level(logging.INFO, logger="pecfetch.pipeline"):
+        summary = make_pipeline({"rossi": box}).run(MODE_RUN, dry_run=True)
+    # "scritti" deve voler dire scritti: in prova a vuoto il conteggio dei
+    # candidati sta in un contatore suo e quello delle scritture resta a zero
+    assert summary.candidates == 1
+    assert summary.written == 0
     assert _coda(cfg) == []
     assert state.get_cursor("rossi", "INBOX").last_uid == 0
+
+
+def test_dry_run_il_log_non_dichiara_scritture(cfg, stack, make_pipeline, caplog):
+    """Chi rilegge il log fra sei mesi non deve dedurne messaggi inesistenti."""
+    box = FakeMailbox()
+    box.add(f.busta_trasporto(), _oggi())
+    with caplog.at_level(logging.INFO, logger="pecfetch.pipeline"):
+        make_pipeline({"rossi": box}).run(MODE_RUN, dry_run=True)
+    righe = [r.getMessage() for r in caplog.records]
+    assert righe, "il riepilogo per casella dovrebbe essere stato scritto"
+    assert not any("scritti" in riga for riga in righe)
+    assert all(riga.startswith("PROVA - ") for riga in righe)
+    assert any("1 da scaricare" in riga for riga in righe)
+
+
+def test_dry_run_non_crea_nemmeno_l_albero(cfg, stack, make_pipeline):
+    """«Prova a vuoto» vale per l'albero prodotto, non solo per il riepilogo."""
+    radice = cfg.output_root / "vuota"
+    writer = OutputWriter(radice, ExtractorSettings.from_config(cfg),
+                          timezone=cfg.timezone, permissions=cfg.permissions,
+                          layout=False)
+    assert not radice.exists()
+    writer.ensure_layout()
+    assert (radice / "coda").is_dir()
 
 
 def test_casella_disabilitata_saltata(cfg, stack, make_pipeline):

@@ -8,6 +8,9 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from . import permessi as perm
+from . import spazio, tempo
+
 
 class ConfigError(Exception):
     """Configurazione assente, malformata o incoerente."""
@@ -45,7 +48,12 @@ class Config:
     archive_path: Path
     log_file: Path | None
     log_level: str = "INFO"
-    timezone: str = "Europe/Rome"
+    #: fuso di **tutte** le date esposte, non solo dei nomi dei file
+    timezone: str = tempo.DEFAULT_TZ
+    #: permessi dell'albero prodotto: dichiarati, non ereditati dalla umask
+    permissions: perm.Permessi = perm.Permessi()
+    #: sotto questa soglia non si comincia a scrivere un messaggio
+    min_free_bytes: int = spazio.DEFAULT_MIN_FREE_BYTES
 
     initial_lookback_days: int = 7
     resync_overlap_days: int = 2
@@ -80,9 +88,15 @@ class Config:
 
     source_path: Path | None = None
 
+    @property
+    def tz(self):
+        """Il fuso già risolto. Validato al caricamento, qui non può fallire."""
+        return tempo.zona(self.timezone)
+
     def account_by_id(self, account_id: str) -> Account | None:
+        wanted = (account_id or "").strip().lower()
         for acc in self.accounts:
-            if acc.id == account_id:
+            if acc.id.lower() == wanted:
                 return acc
         return None
 
@@ -155,7 +169,12 @@ def _resolve_password(raw: dict, secrets: dict, account_id: str, warn) -> tuple[
 
 def _account_from_raw(raw: dict, secrets: dict, defaults: dict, warn) -> Account:
     account_id = str(raw.get("id") or "").strip()
-    address = str(raw.get("address") or "").strip()
+    # Nessun gestore PEC italiano tratta le caselle come sensibili alle
+    # maiuscole: l'indirizzo è un dato del contratto e si normalizza subito, così
+    # non c'è un solo confronto a valle che possa mancare per un LASERMARC@PEC.IT.
+    # La forma scritta resta però quella che si manda al gestore per il login.
+    address_scritto = str(raw.get("address") or "").strip()
+    address = address_scritto.lower()
     if not account_id:
         account_id = address.split("@", 1)[0] if address else ""
     if not account_id:
@@ -183,7 +202,8 @@ def _account_from_raw(raw: dict, secrets: dict, defaults: dict, warn) -> Account
         label=str(raw.get("label") or "").strip(),
         client_id=str(raw.get("client_id") or "").strip(),
         port=port,
-        username=str(raw.get("username") or address).strip(),
+        # lo username non si normalizza: è quello che si manda al gestore
+        username=str(raw.get("username") or address_scritto).strip(),
         folder=str(raw.get("folder") or "INBOX"),
         ssl=ssl and not starttls,
         starttls=starttls,
@@ -218,6 +238,7 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
     archive = extr.get("archive", {})
     arch = data.get("archive", {})
     logs = data.get("logging", {})
+    perms_raw = data.get("permissions", {})
 
     def as_path(value: str) -> Path:
         p = Path(str(value)).expanduser()
@@ -269,17 +290,48 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
 
     accounts: list[Account] = []
     seen: set[str] = set()
+    seen_addr: dict[str, str] = {}
     for raw in raw_accounts:
         acc = _account_from_raw(raw, secrets, fetch, warn)
-        if acc.id in seen:
+        if acc.id.lower() in seen:
             raise ConfigError(f"id casella duplicato: '{acc.id}'")
-        seen.add(acc.id)
+        seen.add(acc.id.lower())
+        # due caselle sullo stesso indirizzo scritte con maiuscole diverse sono
+        # la stessa casella scaricata due volte, con due cursori che si ignorano
+        if acc.address in seen_addr:
+            raise ConfigError(
+                f"casella '{acc.id}': indirizzo {acc.address} già dichiarato "
+                f"da '{seen_addr[acc.address]}'"
+            )
+        seen_addr[acc.address] = acc.id
         accounts.append(acc)
 
     archive_path = (
         as_path(arch["path"]) if arch.get("path") else state_dir / "archivio.sqlite3"
     )
     log_file = as_path(logs["file"]) if logs.get("file") else None
+
+    # Il fuso governa tutte le date esposte: un refuso qui non deve diventare un
+    # silenzioso ripiego su UTC, che è esattamente la mescolanza da evitare.
+    timezone_name = str(general.get("timezone", tempo.DEFAULT_TZ))
+    try:
+        tempo.zona(timezone_name)
+    except ValueError as exc:
+        raise ConfigError(f"[general].timezone: {exc}") from exc
+
+    try:
+        permissions = perm.Permessi(
+            dir_mode=perm.modo(perms_raw.get("dir_mode"), perm.DIR_MODE),
+            file_mode=perm.modo(perms_raw.get("file_mode"), perm.FILE_MODE),
+            shared_dir_mode=perm.modo(perms_raw.get("shared_dir_mode"),
+                                      perm.SHARED_DIR_MODE),
+            group=str(perms_raw.get("group", "")).strip(),
+        )
+    except ValueError as exc:
+        raise ConfigError(f"[permissions]: {exc}") from exc
+    if permissions.group and permissions.gid < 0:
+        warn(f"[permissions].group = '{permissions.group}' non esiste su questa "
+             "macchina: i file resteranno nel gruppo del processo")
 
     return Config(
         output_root=output_root,
@@ -288,7 +340,10 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
         archive_path=archive_path,
         log_file=log_file,
         log_level=str(logs.get("level", "INFO")).upper(),
-        timezone=str(general.get("timezone", "Europe/Rome")),
+        timezone=timezone_name,
+        permissions=permissions,
+        min_free_bytes=int(general.get("min_free_bytes",
+                                       spazio.DEFAULT_MIN_FREE_BYTES)),
         initial_lookback_days=int(fetch.get("initial_lookback_days", 7)),
         resync_overlap_days=int(fetch.get("resync_overlap_days", 2)),
         max_messages_per_run=int(fetch.get("max_messages_per_run", 500)),
@@ -327,6 +382,9 @@ def redacted(cfg: Config) -> dict:
         "output_root": str(cfg.output_root),
         "state_dir": str(cfg.state_dir),
         "archive": str(cfg.archive_path),
+        "timezone": cfg.timezone,
+        "permissions": perm.descrizione(cfg.permissions),
+        "min_free_bytes": cfg.min_free_bytes,
         "accounts": [
             {
                 "id": a.id,
