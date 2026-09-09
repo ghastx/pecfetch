@@ -15,7 +15,7 @@ import re
 import socket
 import ssl
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 # Le buste PEC con allegati pesanti superano il limite di default di imaplib.
 imaplib._MAXLINE = max(imaplib._MAXLINE, 10_000_000)
@@ -26,6 +26,12 @@ _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
 _UID_RE = re.compile(rb"\bUID\s+(\d+)")
 _SIZE_RE = re.compile(rb"\bRFC822\.SIZE\s+(\d+)")
 _INTERNALDATE_RE = re.compile(rb'\bINTERNALDATE\s+"([^"]+)"')
+#: RFC 3501 §9: date-day-fixed ammette il giorno a una cifra riempito con uno
+#: spazio (` 5-Sep-2026`), e la zona è sempre ±HHMM.
+_INTERNALDATE_PARTS = re.compile(
+    r"^\s*(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+"
+    r"(\d{1,2}):(\d{2}):(\d{2})\s+([+-])(\d{2})(\d{2})\s*$"
+)
 
 
 class ImapError(Exception):
@@ -250,18 +256,39 @@ class ImapReader:
 
 
 def _parse_internaldate(blob: bytes) -> datetime | None:
+    """INTERNALDATE normalizzata a UTC, rispettando l'offset che dichiara.
+
+    Non si passa per ``imaplib.Internaldate2tuple``: quella restituisce uno
+    ``struct_time`` in ora **locale della macchina**, e darlo poi a
+    ``calendar.timegm`` — che lo interpreta come UTC — riaggiunge l'offset
+    locale al risultato. Il valore veniva giusto solo su una VM in UTC, e
+    sbagliato di un'ora o due su una in Europe/Rome: due ore di sfasamento su
+    un campo che finisce nel nome della cartella, nell'indice e nell'archivio.
+
+    Il mese si risolve con ``_MONTHS`` e non con ``%b`` di ``strptime``, che
+    dipende dal locale: con ``LC_TIME`` italiano ``%b`` si aspetta ``set``,
+    non ``Sep``, e i nomi dei mesi IMAP sono sempre inglesi.
+    """
     match = _INTERNALDATE_RE.search(blob)
     if not match:
         return None
-    try:
-        parsed = imaplib.Internaldate2tuple(b'INTERNALDATE "' + match.group(1) + b'"')
-        if parsed is None:
-            return None
-        import calendar
-
-        return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
-    except Exception:
+    parts = _INTERNALDATE_PARTS.match(match.group(1).decode("ascii", "replace"))
+    if parts is None:
         return None
+    day, month, year, hour, minute, second, sign, zone_h, zone_m = parts.groups()
+    try:
+        offset = timedelta(hours=int(zone_h), minutes=int(zone_m))
+        if sign == "-":
+            offset = -offset
+        declared = datetime(
+            int(year), _MONTHS.index(month.capitalize()) + 1, int(day),
+            int(hour), int(minute), int(second), tzinfo=timezone(offset),
+        )
+    except ValueError:
+        # mese inesistente, 31 febbraio, offset oltre le 24 ore: la data non si
+        # sa, e non saperla è già gestito a valle (`internaldate=None`)
+        return None
+    return declared.astimezone(timezone.utc)
 
 
 def _batched(items: list[int], size: int):

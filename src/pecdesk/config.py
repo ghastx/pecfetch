@@ -154,6 +154,13 @@ def _load_toml(path: Path) -> dict:
         raise ConfigError(f"file di configurazione non trovato: {path}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"TOML non valido in {path}: {exc}") from exc
+    except OSError as exc:
+        # come in pecfetch.config: un problema di permessi è un problema di
+        # configurazione, non una traccia di stack
+        raise ConfigError(
+            f"file di configurazione non leggibile: {path} "
+            f"({exc.strerror or exc})"
+        ) from exc
 
 
 def _warn_if_world_readable(path: Path, warn) -> None:

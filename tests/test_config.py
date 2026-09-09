@@ -1,5 +1,8 @@
 """Configurazione fuori dal codice, credenziali fuori dal repository."""
 
+import os
+from pathlib import Path
+
 import pytest
 
 from pecfetch.config import ConfigError, load_config, redacted
@@ -115,11 +118,21 @@ def test_accounts_file_separato(tmp_path, monkeypatch):
 
 
 def test_esempio_versionato_e_valido(tmp_path, monkeypatch):
-    """Il file di esempio nel repository deve caricarsi davvero."""
-    from pathlib import Path
+    """Il file di esempio nel repository deve caricarsi davvero.
 
+    L'esempio contiene percorsi assoluti di produzione (`/etc/pecfetch`,
+    `/srv/pec/dati`, ...). Vanno riscritti prima di caricarlo: altrimenti su una
+    macchina dove pecfetch è installato questo test leggerebbe i segreti veri, e
+    fallirebbe appena quel file avesse i permessi che `INSTALL.md` consiglia.
+    """
     esempio = Path(__file__).resolve().parents[1] / "config" / "pecfetch.example.toml"
     testo = esempio.read_text(encoding="utf-8")
+    for produzione, finto in (("/etc/pecfetch", f"{tmp_path}/etc"),
+                              ("/srv/pec/dati", f"{tmp_path}/dati"),
+                              ("/var/lib/pecfetch", f"{tmp_path}/stato"),
+                              ("/var/log/pecfetch", f"{tmp_path}/log")):
+        testo = testo.replace(produzione, finto)
+
     copia = tmp_path / "pecfetch.toml"
     copia.write_text(testo, encoding="utf-8")
     (tmp_path / "caselle.example.toml").write_text(
@@ -127,5 +140,63 @@ def test_esempio_versionato_e_valido(tmp_path, monkeypatch):
         encoding="utf-8")
     monkeypatch.setenv("PECFETCH_PW_ROSSI", "x")
     monkeypatch.setenv("PECFETCH_PW_BIANCHI", "y")
+
     cfg = load_config(copia, warn=lambda m: None)
+
     assert cfg.accounts
+    # l'isolatezza va asserita, non sperata: un percorso assoluto aggiunto
+    # domani all'esempio deve far fallire questo test, non tornare di nascosto
+    # a puntare al filesystem vero
+    for nome, percorso in (("output_root", cfg.output_root),
+                           ("state_dir", cfg.state_dir),
+                           ("archive_path", cfg.archive_path),
+                           ("log_file", cfg.log_file)):
+        assert percorso is not None, nome
+        assert percorso.is_relative_to(tmp_path), f"{nome} esce da tmp_path: {percorso}"
+
+
+# ---------------------------------------------------------------------------
+# il file dei segreti: assente è tollerato, illeggibile no
+# ---------------------------------------------------------------------------
+
+def test_segreti_assenti_restano_un_avviso(tmp_path, monkeypatch):
+    """Le password possono venire da password_env: un file che non c'è non è
+    un errore, ed è la distinzione che i due test successivi difendono."""
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    avvisi = []
+    cfg = load_config(
+        _scrivi(tmp_path, extra=f'secrets_file = "{tmp_path}/manca.toml"'),
+        warn=avvisi.append,
+    )
+    assert cfg.accounts[0].password == "x"
+    assert any("non trovato" in a for a in avvisi)
+
+
+def test_segreti_che_sono_una_directory_danno_errore_di_configurazione(tmp_path):
+    """Prima si avvisava «non trovato» — che è falso — e si moriva molto più a
+    valle con «nessuna password», che non c'entra niente."""
+    (tmp_path / "secrets.toml").mkdir()
+    with pytest.raises(ConfigError, match="segreti non leggibile"):
+        load_config(_scrivi(tmp_path, cred='password_ref = "rossi"',
+                            extra=f'secrets_file = "{tmp_path}/secrets.toml"'))
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root ignora i permessi: il test non proverebbe niente")
+def test_segreti_senza_permessi_danno_errore_di_configurazione(tmp_path):
+    """Il `chmod 600 root:root` che sta a un tasto da quello giusto in
+    INSTALL.md: prima usciva come traccia di stack, non come diagnosi."""
+    segreti = tmp_path / "secrets.toml"
+    segreti.write_text('[passwords]\nrossi = "x"\n', encoding="utf-8")
+    segreti.chmod(0o000)
+    with pytest.raises(ConfigError, match="non leggibile"):
+        load_config(_scrivi(tmp_path, cred='password_ref = "rossi"',
+                            extra=f'secrets_file = "{segreti}"'))
+
+
+def test_accounts_file_illeggibile_da_errore_di_configurazione(tmp_path, monkeypatch):
+    """La stessa lacuna valeva per l'elenco delle caselle."""
+    monkeypatch.setenv("PECFETCH_TEST_PW", "x")
+    (tmp_path / "caselle.toml").mkdir()
+    with pytest.raises(ConfigError):
+        load_config(_scrivi(tmp_path, extra='accounts_file = "caselle.toml"'))

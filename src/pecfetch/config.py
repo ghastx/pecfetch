@@ -101,6 +101,14 @@ def _load_toml(path: Path) -> dict:
         raise ConfigError(f"file di configurazione non trovato: {path}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"TOML non valido in {path}: {exc}") from exc
+    except OSError as exc:
+        # permessi sbagliati, percorso che è una directory, disco che non
+        # risponde: è un problema di configurazione e va detto come tale, non
+        # lasciato risalire come traccia di stack da un'esecuzione notturna
+        raise ConfigError(
+            f"file di configurazione non leggibile: {path} "
+            f"({exc.strerror or exc})"
+        ) from exc
 
 
 def _warn_if_world_readable(path: Path, warn) -> None:
@@ -224,9 +232,23 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
     secrets_file = general.get("secrets_file")
     if secrets_file:
         secrets_path = as_path(secrets_file)
+        # tre casi, non due: assente è tollerato (le password possono venire da
+        # password_env), ma "c'è e non si legge" no. Trattarli allo stesso modo
+        # farebbe fallire l'esecuzione molto più a valle, con un «nessuna
+        # password» che non dice dov'è davvero il problema.
         if secrets_path.is_file():
             _warn_if_world_readable(secrets_path, warn)
             secrets = _load_toml(secrets_path)
+        elif secrets_path.exists():
+            raise ConfigError(
+                f"file dei segreti non leggibile: {secrets_path} non è un file "
+                f"regolare"
+            )
+        elif secrets_path.parent.exists() and not os.access(secrets_path.parent, os.X_OK):
+            raise ConfigError(
+                f"file dei segreti non leggibile: {secrets_path.parent} non è "
+                f"attraversabile da questo utente"
+            )
         else:
             warn(f"file dei segreti non trovato: {secrets_path}")
 
