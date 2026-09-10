@@ -264,7 +264,9 @@ def build_user(item: QueueItem, signals: Signals, material: Material) -> str:
         "mittente_nome": item.sender_name,
         "tipo_busta_pecfetch": item.msg_type,
         "certificato": item.certified,
-        "data": item.date[:19],
+        # intera, offset compreso: è la convenzione del record da cui viene, e
+        # una data senza fuso è una data ambigua anche per chi la legge
+        "data": item.date,
         "allegati": material.inventory or "nessuno",
     }
     history = signals.history

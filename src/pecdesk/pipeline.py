@@ -146,14 +146,22 @@ class Runner:
             model_info=model_info,
         )
 
-    def commit(self, item: QueueItem, outcome: Outcome) -> None:
+    def commit(self, item: QueueItem, outcome: Outcome,
+               summary: RunSummary | None = None) -> None:
         """L'effetto si registra prima di produrlo, e nell'ordine giusto."""
         path = self.store.append(outcome)
         self.state.mark_classified(outcome.id, path.name, outcome.klass)
         try:
             self._sposta(item)
         except (OSError, QueueError) as exc:
+            # L'esito è scritto e lo spostamento si ritenta alla prossima
+            # esecuzione, ma non basta scriverlo nel log: il caso vero è la coda
+            # montata in sola lettura, e chi legge il riepilogo deve saperlo la
+            # mattina stessa, non il giorno dopo per via di `move_pending`.
             log.warning("%s: spostamento rimandato (%s)", outcome.id, exc)
+            if summary is not None:
+                summary.problems.append(
+                    f"{outcome.id}: spostamento rimandato ({exc})")
             return
         self.state.mark_archived(outcome.id)
 
@@ -245,7 +253,7 @@ class Runner:
                 continue
 
             consecutive = 0
-            self.commit(item, outcome)
+            self.commit(item, outcome, summary)
             summary.classified += 1
             summary.outcomes.append(outcome)
             summary.tokens_in += int(outcome.model.get("token_in", 0) or 0)

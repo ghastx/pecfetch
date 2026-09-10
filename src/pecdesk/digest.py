@@ -16,6 +16,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
+from pecfetch import tempo
+
 from .outcomes import Outcome
 
 MONTHS = ("gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
@@ -55,6 +57,18 @@ def short_date(raw: str) -> str:
     return raw.strip()
 
 
+def _quando(outcome: Outcome) -> tuple:
+    """Ordine cronologico, non alfabetico.
+
+    `outcome.date` esce dal record d'indice con l'offset del fuso dichiarato, e
+    due ISO con offset diversi non si ordinano bene come stringhe: nell'ora del
+    ritorno all'ora solare `02:30+02:00` precede `02:30+01:00` ma ordina dopo. È
+    la stessa regola che `queue._ordine` applica alla coda.
+    """
+    letto = tempo.letto(outcome.date)
+    return (0, letto.timestamp()) if letto else (1, 0.0)
+
+
 def _sort_key(outcome: Outcome) -> tuple:
     deadline = outcome.deadline or {}
     raw = str(deadline.get("data") or "")
@@ -72,7 +86,8 @@ def _sort_key(outcome: Outcome) -> tuple:
         anno = re.search(r"\b(20\d{2})\b", raw)
         return (0, f"{anno.group(1) if anno else '9999'}-{mese:02d}-"
                    f"{int(match.group(1)):02d}")
-    return (1, outcome.date or "")
+    # nessuna data di termine riconosciuta: si ripiega sull'arrivo, a istanti
+    return (1,) + _quando(outcome)
 
 
 @dataclass
@@ -149,11 +164,11 @@ def build(outcomes, unworked=None, day: date | None = None,
         else:
             digest.ordinary.append(outcome)
 
-    digest.suspicious.sort(key=lambda o: o.date or "")
+    digest.suspicious.sort(key=_quando)
     digest.deadlines.sort(key=_sort_key)
-    digest.attention.sort(key=lambda o: o.date or "")
-    digest.forwards.sort(key=lambda o: (o.recipient_alias, o.date or ""))
-    digest.ordinary.sort(key=lambda o: (o.doc_type, o.date or ""))
+    digest.attention.sort(key=_quando)
+    digest.forwards.sort(key=lambda o: (o.recipient_alias,) + _quando(o))
+    digest.ordinary.sort(key=lambda o: (o.doc_type,) + _quando(o))
     return digest
 
 

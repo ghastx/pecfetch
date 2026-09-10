@@ -1,10 +1,12 @@
 """Lettura della coda di pecfetch, e spostamento di ciò che è stato lavorato.
 
-Due regole, entrambe non negoziabili:
+Tre regole, tutte non negoziabili:
 
   * i file di input non si modificano mai — si leggono e basta;
   * un percorso letto dentro ``messaggio.json`` è un dato, non un percorso: si
-    verifica che resti dentro la cartella del messaggio prima di aprirlo.
+    verifica che resti dentro la cartella del messaggio prima di aprirlo;
+  * il numero di schema si legge **prima** di tutto il resto, e una versione
+    sconosciuta ferma quel messaggio invece di essere interpretata a caso.
 
 La seconda sembra pedanteria — pecfetch sanifica già i nomi — ma il contenuto di
 quel JSON deriva da quello che ha spedito un ignoto, e questo programma esiste
@@ -28,11 +30,17 @@ FILE_BODY = "corpo.txt"
 
 #: esiti dell'estrazione che indicano testo potenzialmente sbagliato
 OCR_METHODS = frozenset({"pdf_ocr", "image_ocr"})
-#: esiti che indicano testo assente: il giudizio dovrà tenerne conto
-NO_TEXT_STATUSES = frozenset({
-    "empty", "failed", "unsupported", "tool_missing", "disabled", "blocked_type",
-    "skipped_too_large", "archive_limit", "encrypted", "unsupported_archive",
-})
+
+#: Le versioni del contratto di pecfetch che questo consumatore sa leggere.
+#:
+#: È l'unica ragione per cui pecfetch scrive un numero di schema: se lo si
+#: ignorasse, tanto varrebbe toglierlo. Da `/1` a `/2` la forma dei campi non è
+#: cambiata — sarebbe passata inosservata — ma il significato sì: date con
+#: offset misti invece che nel fuso dichiarato, indirizzi verbatim invece che
+#: minuscoli. Una versione che non compare qui non si legge: il messaggio resta
+#: in coda e viene segnalato. Allungare questo elenco è una decisione presa
+#: guardando cosa è cambiato, non un adeguamento automatico.
+SCHEMA_LETTI = frozenset({"pecfetch/messaggio/2"})
 
 
 class QueueError(Exception):
@@ -106,7 +114,11 @@ class QueueItem:
 
     @property
     def mailbox_address(self) -> str:
-        # come sender e sender_domain: gli indirizzi si confrontano minuscoli
+        # Il minuscolo lo mette pecfetch alla fonte (`parse_addresses`, daticert,
+        # indirizzo della casella) e il contratto lo garantisce su tutti gli
+        # indirizzi esposti: la regola vive lì, non qui. Questo `.lower()` — come
+        # quelli di sender, sender_domain e recipients — è quindi ridondante, ed
+        # è tenuto solo come seconda difesa su un confine di fiducia.
         return str(self.record.get("casella", {}).get("indirizzo", "")).lower()
 
     @property
@@ -215,6 +227,19 @@ def read_item(path: Path) -> QueueItem:
         raise QueueError(f"{path.name}: metadati non validi ({exc})") from exc
     if not isinstance(record, dict) or not record.get("id"):
         raise QueueError(f"{path.name}: metadati privi di 'id'")
+    schema = str(record.get("schema", ""))
+    if schema not in SCHEMA_LETTI:
+        # Non si prova a leggerlo lo stesso: i campi hanno gli stessi nomi anche
+        # quando vogliono dire un'altra cosa, quindi ogni `.get()` cadrebbe sul
+        # proprio default e ne uscirebbe un messaggio senza mittente e senza
+        # data, classificato come se fosse a posto.
+        atteso = ", ".join(sorted(SCHEMA_LETTI))
+        raise QueueError(
+            f"{path.name}: schema {schema or 'assente'}, questo pecdesk legge "
+            f"{atteso}. Il messaggio resta in coda e non viene classificato: "
+            f"aggiorna pecdesk, oppure verifica quale pecfetch ha scritto questa "
+            f"cartella."
+        )
     attachments = [
         _attachment_from_meta(raw)
         for raw in record.get("allegati", []) or []
@@ -295,4 +320,4 @@ def move_to_worked(item_path: Path, worked_dir: Path,
 
 
 __all__ = ["Attachment", "QueueItem", "QueueError", "read_item", "scan",
-           "move_to_worked", "OCR_METHODS", "NO_TEXT_STATUSES"]
+           "move_to_worked", "OCR_METHODS", "SCHEMA_LETTI"]

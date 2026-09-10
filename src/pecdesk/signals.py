@@ -19,6 +19,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pecfetch import tempo
+
 from .config import SuspicionLimits
 from .queue import QueueItem
 
@@ -143,20 +145,26 @@ class ArchiveHistory:
         ).fetchone()
         total = int(row[0] or 0)
         days = 0
-        if row[1] and row[2]:
-            try:
-                from datetime import datetime
-
-                first = datetime.fromisoformat(str(row[1])[:19])
-                last = datetime.fromisoformat(str(row[2])[:19])
-                days = max((last - first).days, 0)
-            except ValueError:
-                days = 0
+        # `tempo.letto` e basta: tagliare l'offset con uno slice e trattare il
+        # resto come naive sarebbe una seconda convenzione di lettura delle date
+        # accanto a quella del contratto, e in archivio convivono ancora le righe
+        # scritte prima che la convenzione ci fosse.
+        first, last = tempo.letto(row[1]), tempo.letto(row[2])
+        if first is not None and last is not None:
+            days = max((last - first).days, 0)
         self._coverage[account] = (total, days)
         return total, days
 
     def lookup(self, item: QueueItem) -> History:
         total, days = self._mailbox_coverage(item.account)
+        # Confronto fra stringhe, e qui resta tale: in SQLite queste colonne sono
+        # TEXT, e riscriverlo in istanti vorrebbe dire leggere tutta la tabella
+        # per contare due righe. Serve solo a non contare i messaggi arrivati
+        # dopo (il messaggio stesso lo esclude già `id <> ?`), e lo scarto è
+        # quello dichiarato nel README: un'ora, due volte l'anno, più le righe
+        # scritte prima della convenzione sul fuso. Su un conteggio di
+        # corrispondenza pregressa non sposta nulla; se un giorno servisse
+        # esatto, il posto da cambiare è questo.
         before = item.date or "9999"
         on_mailbox = self.archive.db.execute(
             "SELECT COUNT(*) FROM messages WHERE account=? AND from_addr=? "

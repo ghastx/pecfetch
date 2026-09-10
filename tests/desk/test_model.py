@@ -134,3 +134,10 @@ def test_la_stima_dei_token_e_ragionevole(queue_dir, directives):
     request = _request(queue_dir, directives, body="parola " * 200)
     stima = request.estimated_tokens()
     assert 0 < stima < 4000
+
+
+def test_la_data_arriva_al_modello_con_il_suo_offset(queue_dir, directives):
+    """Troncarla a 19 caratteri la renderebbe ambigua proprio nel campo che il
+    modello usa per capire se un termine è già scaduto."""
+    request = _request(queue_dir, directives, date="2026-09-07T08:30:00+02:00")
+    assert '"data": "2026-09-07T08:30:00+02:00"' in request.user

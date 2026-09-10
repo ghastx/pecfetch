@@ -121,3 +121,57 @@ def test_il_resoconto_dice_su_cosa_si_e_giudicato(queue_dir):
     assert resoconto["allegati_da_ocr"] == ["x.pdf"]
     assert any(cut["cosa"] == "corpo" for cut in resoconto["estratti"])
     assert all(cut["inviati"] < cut["totali"] for cut in resoconto["estratti"])
+
+
+def test_il_caso_reale_dei_settemila_caratteri(queue_dir):
+    """Il caso che sta in coda: un allegato di settemila caratteri di cui i primi
+    cinquecento contengono tutto ciò che serve a classificare, e il resto è un
+    elenco di duecento nominativi con date di nascita.
+
+    Passarlo intero costerebbe dieci volte tanto e farebbe uscire dallo studio
+    dati personali che con la classificazione non c'entrano niente. Quel che esce
+    è la testa più le finestre sulle parole che contano, e il taglio è dichiarato
+    due volte: nel testo che vede il modello e nell'esito che legge il titolare.
+
+    Resta un margine dichiarato: la testa è un numero di caratteri, non un
+    confine di senso. Con `allegato_testa_caratteri` a 600 e la parte utile lunga
+    500, le prime righe dell'elenco partono lo stesso — due su duecento. È la
+    manopola giusta per stringere, e sta in configurazione.
+    """
+    testa = ("AGENZIA DELLE ENTRATE - RISCOSSIONE\n"
+             "Cartella di pagamento n. 123/2026 - protocollo 4567.\n"
+             "Il termine per il ricorso scade entro il 3 ottobre 2026.\n"
+             ).ljust(500, ".")
+    elenco = "\n".join(f"{i:03d} Nominativo Cognome{i} nato il "
+                       f"{(i % 28) + 1:02d}/{(i % 12) + 1:02d}/19{50 + (i % 50)}"
+                       for i in range(200))
+    intero = testa + "\n" + elenco
+    assert len(intero) > 7000
+
+    write_message(queue_dir, "cartella",
+                  subject="Cartella di pagamento",
+                  body="In allegato la cartella.",
+                  attachments=[make_attachment("cartella.pdf", text=intero)])
+    item = read_item(next(queue_dir.iterdir()))
+    limits = MaterialLimits()
+    material = build(item, limits, KEYWORDS)
+
+    # quello che serve a classificare è passato per intero
+    assert "AGENZIA DELLE ENTRATE" in material.untrusted
+    assert "Cartella di pagamento n. 123/2026" in material.untrusted
+    assert "3 ottobre 2026" in material.untrusted
+
+    # l'elenco no: non oltre le due righe che sfiorano il limite della testa
+    nominativi = material.untrusted.count("nato il")
+    assert nominativi <= 2, f"{nominativi} nominativi su 200 sono usciti"
+    assert "Cognome50" not in material.untrusted
+    assert "Cognome199" not in material.untrusted
+
+    # e il taglio è dichiarato: nel testo per il modello, nell'esito per il titolare
+    assert "caratteri omessi" in material.untrusted
+    taglio = next(c for c in material.truncations
+                  if c["cosa"] == "allegato:cartella.pdf")
+    assert taglio["totali"] == len(intero)
+    assert taglio["inviati"] <= limits.attachment_chars
+    assert taglio["inviati"] * 5 < taglio["totali"]      # non dieci volte tanto
+    assert material.as_dict()["estratti"]

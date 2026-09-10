@@ -17,6 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from pecdesk.model import Judgment  # noqa: E402
+from pecfetch import __version__ as VERSIONE_PECFETCH  # noqa: E402
+from pecfetch.output import SCHEMA_MESSAGE  # noqa: E402
 
 REGOLE = """
 versione = "test-1"
@@ -111,7 +113,8 @@ def write_message(queue_dir: Path, msg_id: str, *, sender: str = "cliente@pec.it
                   attachments: list[dict] | None = None,
                   notes: list[str] | None = None,
                   receipt: dict | None = None,
-                  body_truncated: bool = False) -> Path:
+                  body_truncated: bool = False,
+                  schema: str = SCHEMA_MESSAGE) -> Path:
     """Scrive una cartella di messaggio con la forma prodotta da pecfetch."""
     attachments = attachments or []
     folder = queue_dir / f"{date[:10].replace('-', '')}_{account}_{msg_id[:12]}"
@@ -131,8 +134,11 @@ def write_message(queue_dir: Path, msg_id: str, *, sender: str = "cliente@pec.it
         clean.append(entry)
 
     record = {
-        "schema": "pecfetch/messaggio/1",
-        "generato_da": "pecfetch/1.0.0",
+        # dalla fonte, non ricopiati: una coda finta che dichiara una versione
+        # diversa da quella che pecfetch scrive non ha più «la forma vera», ed è
+        # esattamente il difetto che questi test devono difendere
+        "schema": schema,
+        "generato_da": f"pecfetch/{VERSIONE_PECFETCH}",
         "id": msg_id,
         "acquisito_il": date,
         "casella": {"id": account, "etichetta": f"{client} S.r.l.",

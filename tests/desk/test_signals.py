@@ -259,3 +259,38 @@ def test_storico_trovato_anche_se_il_mittente_scriveva_in_maiuscolo(tmp_path, qu
         found = history.lookup(item)
     assert found.seen_on_mailbox == 1
     assert found.novel_on_mailbox is False
+
+
+def test_copertura_calcolata_su_istanti_non_su_stringhe_tagliate(tmp_path, queue_dir):
+    """In archivio convivono righe scritte prima della convenzione sul fuso.
+
+    Tagliare l'offset con uno slice e trattare il resto come naive è una seconda
+    convenzione di lettura accanto a quella del contratto: qui la copertura si
+    misura fra istanti, quale che sia l'offset con cui la riga è stata scritta.
+    """
+    from pecfetch.archive import Archive
+
+    path = tmp_path / "archivio.sqlite3"
+    righe = [
+        # la più vecchia, scritta quando la ricezione si normalizzava a UTC
+        ("vecchia", "2026-01-01T00:30:00+00:00"),
+        # la più recente, con l'offset del fuso dichiarato
+        ("recente", "2026-04-01T01:30:00+02:00"),
+    ]
+    with Archive(path) as writable:
+        for msg_id, quando in righe:
+            writable.add({
+                "id": msg_id, "casella": {"id": "rossi", "cliente": "ROSSI"},
+                "mittente": {"indirizzo": "a@pec.it", "dominio": "pec.it"},
+                "data": {"certificata": quando}, "acquisito_il": quando,
+                "tipo": "posta_certificata", "oggetto": "x",
+                "destinatari": [], "allegati": [], "contenuto": {},
+            }, "indice/2026-01-01.jsonl")
+
+    item = _item(queue_dir, msg_id="nuovo1", sender="nuovo@pec.it")
+    with ArchiveHistory(path, SuspicionLimits()) as history:
+        found = history.lookup(item)
+
+    # 2026-01-01T00:30+00:00 -> 2026-04-01T01:30+02:00 sono 89 giorni e 23 ore
+    assert found.mailbox_total == 2
+    assert found.coverage_days == 89

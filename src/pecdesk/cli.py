@@ -454,19 +454,25 @@ def cmd_check(args, cfg: Config, directives: Directives) -> int:
          f"({len(directives.instructions)} caratteri)")
     _out(f"  sempre al titolare: {', '.join(directives.always_owner_types)}")
 
-    for label, path, writable in (
-        ("coda", cfg.queue_dir, False),
-        ("esiti", cfg.outcomes_dir, True),
-        ("lavorati", cfg.worked_dir, True),
-        ("stato", cfg.state_dir, True),
+    # `coda` serve in scrittura come le altre: uscire dalla coda è un `rename`, e
+    # spostare una cartella richiede il permesso sulla directory che la contiene.
+    # È il controllo che avrebbe intercettato prima la coda montata in sola
+    # lettura, invece di scoprirlo a spostamento fallito.
+    for label, path, perche in (
+        ("coda", cfg.queue_dir, "serve il rename fuori dalla coda"),
+        ("esiti", cfg.outcomes_dir, "ci si scrivono gli esiti"),
+        ("lavorati", cfg.worked_dir, "ci finisce il lavorato"),
+        ("stato", cfg.state_dir, "ci sta lo stato locale"),
     ):
         exists = path.exists()
-        ok = exists and (not writable or os.access(path, os.W_OK))
+        ok = exists and os.access(path, os.W_OK)
         _out(f"  {label:<10} {path}  {'ok' if ok else 'MANCANTE o non scrivibile'}")
-        if not ok and writable:
-            problems.append(f"{label}: {path} non scrivibile")
-        elif not exists and not writable:
+        if not exists:
             problems.append(f"{label}: {path} non esiste")
+        elif not ok:
+            problems.append(
+                f"{label}: {path} non scrivibile ({perche}; la cartella deve "
+                f"comparire fra i ReadWritePaths dell'unit systemd)")
 
     # Spazio: pecdesk scrive meno di pecfetch, ma scrive nello stesso albero, e
     # un disco pieno gli impedisce di registrare gli esiti già pagati al modello.

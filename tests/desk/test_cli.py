@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
 from desk.fabbrica import ISTRUZIONI, REGOLE, make_attachment, write_message
 
 from pecdesk.cli import EXIT_OK, EXIT_PARTIAL, main
@@ -147,3 +149,45 @@ def test_stato_e_riprova(tmp_path, capsys):
 def test_configurazione_mancante_e_un_errore_chiaro(tmp_path, capsys):
     assert main(["-c", str(tmp_path / "assente.toml"), "check"]) == 1
     assert "nessun file di configurazione trovato" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root ignora i permessi: il test non proverebbe niente")
+def test_check_segnala_la_coda_non_scrivibile(tmp_path, capsys):
+    """Uscire dalla coda è un `rename`, e spostare una cartella richiede il
+    permesso sulla directory che la contiene. È il difetto dell'unit systemd che
+    si è già pagato una volta: `check` deve trovarlo prima della notte, non
+    scoprirlo a spostamento fallito."""
+    config, queue = _setup(tmp_path)
+    write_message(queue, "m1")
+    modo = queue.stat().st_mode
+    os.chmod(queue, 0o555)
+    try:
+        codice = main(["-c", config, "check"])
+        uscita = capsys.readouterr().out
+    finally:
+        os.chmod(queue, modo)
+
+    assert codice == EXIT_PARTIAL
+    assert "MANCANTE o non scrivibile" in uscita
+    assert "rename fuori dalla coda" in uscita
+    assert "ReadWritePaths" in uscita
+
+
+def test_check_dice_perche_la_coda_serve_in_scrittura(tmp_path, capsys, monkeypatch):
+    """Come sopra, ma senza dipendere dai permessi veri: il test gira anche da
+    root, dove `os.access` direbbe sempre di sì."""
+    from pecdesk import cli
+
+    config, queue = _setup(tmp_path)
+    write_message(queue, "m1")
+    vero = cli.os.access
+    monkeypatch.setattr(cli.os, "access",
+                        lambda p, m: False if Path(p) == queue else vero(p, m))
+
+    codice = main(["-c", config, "check"])
+    uscita = capsys.readouterr().out
+
+    assert codice == EXIT_PARTIAL
+    assert "rename fuori dalla coda" in uscita
+    assert "ReadWritePaths" in uscita

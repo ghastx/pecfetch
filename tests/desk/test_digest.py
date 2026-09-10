@@ -158,3 +158,31 @@ def test_l_etichetta_della_regola_parla_meglio_di_altro():
     testo = render_text(digest)
     assert "invio fallito" in testo
     assert "— altro" not in testo
+
+
+# -- l'ordine è cronologico, non alfabetico ----------------------------------
+
+def test_ordine_cronologico_anche_col_cambio_di_ora():
+    """Le date escono con l'offset del fuso dichiarato, e nell'ora del ritorno
+    all'ora solare `02:30+02:00` precede `02:30+01:00` pur ordinandosi dopo come
+    stringa. Il riepilogo è la pagina dove quell'ordine si vede."""
+    prima = _o("prima", date="2026-10-25T02:30:00+02:00")
+    dopo = _o("dopo", date="2026-10-25T02:30:00+01:00")
+
+    digest = build([dopo, prima], day=date(2026, 10, 25))
+    assert [o.id for o in digest.ordinary] == ["prima", "dopo"]
+
+    sospetti = build(
+        [_o("s-dopo", klass="sospetto", suspicion_level="probabile",
+            date="2026-10-25T02:30:00+01:00"),
+         _o("s-prima", klass="sospetto", suspicion_level="probabile",
+            date="2026-10-25T02:30:00+02:00")],
+        day=date(2026, 10, 25))
+    assert [o.id for o in sospetti.suspicious] == ["s-prima", "s-dopo"]
+
+
+def test_una_data_illeggibile_va_in_fondo_e_non_fa_saltare_l_ordine():
+    digest = build([_o("rotta", date="non una data"),
+                    _o("buona", date="2026-09-07T08:00:00+02:00")],
+                   day=date(2026, 9, 7))
+    assert [o.id for o in digest.ordinary] == ["buona", "rotta"]

@@ -129,10 +129,13 @@ inesistente è un errore fatale al caricamento, non un ripiego silenzioso.
 
 Ordinare stringhe ISO con lo stesso offset è corretto **tranne** nell'ora del
 ritorno all'ora solare, quando `02:30+02:00` precede `02:30+01:00` ma ordina
-dopo. Dove l'ordine conta — cursore di stato, ordine della coda di pecdesk — si
-confrontano istanti e non stringhe; resta un possibile scarto di un'ora sui
-soli filtri `--since`/`--until` dell'archivio, due volte l'anno. Con `UTC` non
-esisterebbe: è il prezzo della leggibilità, dichiarato.
+dopo. Dove l'ordine conta — cursore di stato, ordine della coda di pecdesk,
+sezioni del riepilogo — si confrontano istanti e non stringhe. Resta un
+possibile scarto di un'ora, due volte l'anno, dove il confronto è dentro una
+query SQL su colonne di testo: i filtri `--since`/`--until` dell'archivio e il
+conteggio «questo mittente ha già scritto?» di pecdesk. Su quei due non sposta
+niente, ed è dichiarato qui invece che nascosto. Con `UTC` non esisterebbe: è il
+prezzo della leggibilità.
 
 ### Indirizzi: sempre minuscoli
 
@@ -363,7 +366,8 @@ al mese.
 
 * **`queue`** — legge `coda/<messaggio>/`. Un percorso letto dentro
   `messaggio.json` è un dato, non un percorso: si verifica che resti dentro la
-  cartella del messaggio prima di aprirlo.
+  cartella del messaggio prima di aprirlo. E si legge il numero di schema prima
+  di tutto il resto: vedi [Il numero di schema](#il-numero-di-schema).
 * **`directives`** — le due fonti di direttive, con le loro impronte SHA-256.
 * **`rules`** — le certezze: mittente, dominio, casella, tipo di busta. Nessuna
   chiamata.
@@ -375,6 +379,25 @@ al mese.
 * **`decide`** — funzione pura: si prova per intero senza chiamare niente.
 * **`state`** — SQLite proprio: claim, riconciliazione, riepiloghi, tentativi.
 * **`outcomes`** — `esiti/`, append-only, con le correzioni accanto.
+
+## Il numero di schema
+
+pecfetch marca ogni `messaggio.json` con `"schema": "pecfetch/messaggio/2"`, e
+pecdesk **lo legge e si ferma** davanti a una versione che non conosce: il
+messaggio resta in coda, non viene classificato, e il motivo compare fra i
+problemi dell'esecuzione, quindi nelle note del riepilogo e in `pecdesk check`.
+
+È l'unica ragione per cui quel numero esiste. Da `/1` a `/2` la forma dei campi
+non è cambiata — un consumatore distratto non se ne sarebbe accorto — ma il
+significato sì: date con l'offset del gestore invece che nel fuso dichiarato,
+indirizzi verbatim invece che minuscoli. Leggere lo stesso un record di una
+versione sconosciuta significa far cadere ogni `.get()` sul proprio default e
+produrre un messaggio senza mittente e senza data, classificato come se fosse a
+posto. Meglio un messaggio fermo e dichiarato.
+
+Le versioni ammesse stanno in `queue.SCHEMA_LETTI`, in un posto solo. Allungare
+quell'elenco è una decisione che si prende guardando cosa è cambiato, non un
+adeguamento automatico: per questo pecdesk non lo importa da pecfetch.
 
 ## Le direttive
 
