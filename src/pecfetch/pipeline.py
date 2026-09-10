@@ -174,10 +174,14 @@ class Pipeline:
             # Meglio non cominciare che cominciare e lasciare a metà: un disco
             # pieno fa fallire anche le scritture di stato.
             log.error("spazio insufficiente, nessun messaggio scaricato: %s", motivo)
+            errore = f"spazio insufficiente: {motivo}"
             for account in todo:
-                risultato = AccountResult(account_id=account.id, ok=False,
-                                          error=f"spazio insufficiente: {motivo}")
-                summary.results.append(risultato)
+                summary.results.append(
+                    AccountResult(account_id=account.id, ok=False, error=errore))
+                # anche qui si annota per casella, come nel percorso di errore
+                # normale: chi guarda `pecfetch status` deve vedere il motivo,
+                # non l'esito della volta prima, che era andata bene
+                self.state.mark_run(account.id, account.folder, False, errore)
                 if self.run_id is not None:
                     self.state.log_error(self.run_id, account.id, "spazio", motivo)
             return summary

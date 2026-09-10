@@ -31,6 +31,10 @@ timezone = "Europe/Rome"
 # da solo: `pecdesk stato` lo mostra, `pecdesk riprova <id>` lo sblocca.
 tentativi_massimi = 3
 
+# Soglia di spazio libero segnalata da `pecdesk check`. Da tenere uguale a
+# quella di pecfetch: scrivono sullo stesso filesystem.
+min_free_bytes = 1073741824   # 1 GiB
+
 
 [permissions]
 # Permessi di ciò che pecdesk scrive: esiti/, lavorati/ e lo stato locale.

@@ -10,4 +10,8 @@ L'obiettivo è la **selezione**, non l'analisi: capire che tipo di documento è
 arrivato e dove va, non leggere gli atti.
 """
 
-__version__ = "1.0.0"
+# Un pacchetto solo, distribuito insieme: il numero è quello di pecfetch e non
+# una seconda copia da tenere allineata a mano.
+from pecfetch import __version__
+
+__all__ = ["__version__"]

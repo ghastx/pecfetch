@@ -21,6 +21,7 @@ def _setup(tmp_path) -> tuple[str, Path]:
 output_root = "{root}"
 state_dir = "{tmp_path / 'stato'}"
 archive_path = "{tmp_path / 'archivio.sqlite3'}"
+min_free_bytes = 0
 
 [direttive]
 regole = "{tmp_path / 'direttive' / 'regole.toml'}"

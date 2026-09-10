@@ -471,7 +471,7 @@ def cmd_check(args, cfg: Config, directives: Directives) -> int:
     # Spazio: pecdesk scrive meno di pecfetch, ma scrive nello stesso albero, e
     # un disco pieno gli impedisce di registrare gli esiti già pagati al modello.
     ok_spazio, motivo = spazio.sufficiente(
-        (cfg.outcomes_dir, cfg.worked_dir, cfg.state_dir), spazio.DEFAULT_MIN_FREE_BYTES)
+        (cfg.outcomes_dir, cfg.worked_dir, cfg.state_dir), cfg.min_free_bytes)
     if ok_spazio:
         _out(f"  spazio     {spazio.leggibile(spazio.liberi(cfg.output_root))} liberi")
     else:

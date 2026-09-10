@@ -14,7 +14,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pecfetch import permessi as perm, tempo
+from pecfetch import permessi as perm, spazio, tempo
 
 
 class ConfigError(Exception):
@@ -123,6 +123,9 @@ class Config:
     timezone: str = tempo.DEFAULT_TZ
     #: lo stesso modello di permessi di pecfetch, per gli esiti e i lavorati
     permissions: perm.Permessi = perm.Permessi()
+    #: soglia di spazio libero, dichiarata come in pecfetch e non ereditata
+    #: da una costante: le due metà scrivono sullo stesso filesystem
+    min_free_bytes: int = spazio.DEFAULT_MIN_FREE_BYTES
     #: dopo N tentativi falliti un messaggio resta in coda ma non si ritenta
     max_attempts: int = 3
 
@@ -344,6 +347,8 @@ def load_config(path: str | os.PathLike | None = None, warn=None) -> Config:
         log_level=str(logs.get("level", "INFO")).upper(),
         timezone=timezone_name,
         permissions=permissions,
+        min_free_bytes=int(general.get("min_free_bytes",
+                                       spazio.DEFAULT_MIN_FREE_BYTES)),
         max_attempts=int(general.get("tentativi_massimi", 3)),
         source_path=config_path,
     )
@@ -366,6 +371,7 @@ def redacted(cfg: Config) -> dict:
                     "ritentativi": cfg.api.max_retries},
         "fuso": cfg.timezone,
         "permessi": perm.descrizione(cfg.permissions),
+        "min_free_bytes": cfg.min_free_bytes,
         "riepilogo": {"destinatario": cfg.digest.to or "<non impostato>",
                       "smtp": f"{cfg.digest.smtp_host}:{cfg.digest.smtp_port}"
                               if cfg.digest.smtp_host else "<non impostato>",

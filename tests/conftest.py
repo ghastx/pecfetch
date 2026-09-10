@@ -126,6 +126,11 @@ def cfg(tmp_path, account) -> Config:
         max_messages_per_run=100,
         extraction_enabled=True,
         ocr_enabled=False,          # niente OCR nei test: dipende da tesseract
+        # E niente guardia sullo spazio: con la soglia di default l'esito dei
+        # test dipenderebbe da quanto spazio ha la macchina di chi li esegue.
+        # La guardia si prova dove è il soggetto, in tests/test_spazio.py, con
+        # una soglia dichiarata e il filesystem simulato.
+        min_free_bytes=0,
     )
 
 

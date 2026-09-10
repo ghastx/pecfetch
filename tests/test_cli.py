@@ -15,6 +15,7 @@ def config_file(tmp_path, monkeypatch):
 [general]
 output_root = "{tmp_path}/condivisa"
 state_dir = "{tmp_path}/stato"
+min_free_bytes = 0
 
 [[accounts]]
 id = "rossi"
@@ -99,6 +100,19 @@ def test_receipts_vuote(config_file, capsys):
 
 def test_backfill_con_data_invalida(config_file):
     assert main(["-c", str(config_file), "backfill", "--since", "ieri"]) == EXIT_FATAL
+
+
+def test_il_numero_di_versione_ha_una_fonte_sola():
+    """Tre copie a mano di un numero sono tre copie che prima o poi divergono.
+
+    `pyproject.toml` lo legge da `pecfetch.__version__` con
+    `[tool.setuptools.dynamic]`, e pecdesk lo importa da lì: qui si verifica il
+    secondo dei due, l'unico che si può controllare senza installare.
+    """
+    import pecdesk
+    import pecfetch
+
+    assert pecdesk.__version__ is pecfetch.__version__
 
 
 def test_check_dichiara_fuso_permessi_e_spazio(config_file, capsys):

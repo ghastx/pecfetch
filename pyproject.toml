@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pecfetch"
-version = "1.0.0"
+# Il numero sta in src/pecfetch/__init__.py e basta: setuptools lo legge da lì
+# senza importare il pacchetto. Finisce anche in ogni messaggio.json prodotto.
+dynamic = ["version"]
 description = "pecfetch: estrattore read-only di caselle PEC. pecdesk: smistamento della coda con l'API Anthropic"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +31,9 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 pecfetch = "pecfetch.cli:main"
 pecdesk = "pecdesk.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "pecfetch.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
